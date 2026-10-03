@@ -7,6 +7,15 @@ All notable changes to browden are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **`press_key`: `Shift+Tab` and optional selector.** Reverse tab-order
+  traversal is a first-class control key (`Shift+Tab` in a host's `keys:` list
+  and in the `press_key` call). Omitting `css_selector` sends the key to the
+  currently-focused element instead of retargeting — still host-gated and
+  default-deny per key, so a second `Shift+Tab` or a follow-up `PageUp`/`Home`
+  can land on whatever the first press focused. An allowlist that lists `Tab`
+  still refuses `Shift+Tab`.
+
 ### Changed
 - **Release skill: the version-bump PR is built in a temporary worktree
   (maintainers).** `maintainers/github-release/SKILL.md` now says to prepare

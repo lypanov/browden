@@ -292,5 +292,7 @@ def test_activation_keys_are_control_keys_only():
     # The universe press-key may ever send: activation/navigation, never characters.
     assert "Enter" in ACTIVATION_KEYS and "ArrowDown" in ACTIVATION_KEYS
     assert "Escape" in ACTIVATION_KEYS and "Tab" in ACTIVATION_KEYS
-    for ch in ("a", "A", "1", " ", "x", "Delete", "Backspace"):
+    assert "Shift+Tab" in ACTIVATION_KEYS
+    for ch in ("a", "A", "1", " ", "x", "Delete", "Backspace",
+               "Shift-Tab", "shift+tab", "Shift+tab"):
         assert ch not in ACTIVATION_KEYS, ch

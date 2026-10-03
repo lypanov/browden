@@ -3,11 +3,14 @@
 Goes through ``BrowserSessionManager.press_key`` -> ``backend.press_key_element`` —
 the same path the ``press_key`` MCP tool takes after gating — so it exercises the
 live chain: find one element -> visible/enabled -> JS ``focus()`` + ``send_keys``
-of a control key. The page is a keyboard-operable list of ``<li tabindex>`` rows
-(the shape a coordinate ``click`` can't reach): each row's ``keydown`` handler
-echoes what happened into ``#picked``, so re-querying that echo (the cache is
-invalidated by the press) proves the key actually reached the focused element.
-The page is an inline ``data:`` document, so the run is offline.
+of a control key (or, with no selector, ``send_keys`` on the current focus). The
+page is a keyboard-operable list of ``<li tabindex>`` rows (the shape a
+coordinate ``click`` can't reach): each row's ``keydown`` handler echoes what
+happened into ``#picked``, so re-querying that echo (the cache is invalidated
+by the press) proves the key actually reached the focused element. A second
+inline page of three ``<input>``s proves ``Shift+Tab`` is a real shift-modified
+Tab that walks focus backwards. Both pages are ``data:`` documents, so the run
+is offline.
 """
 import urllib.parse
 
@@ -38,6 +41,34 @@ HTML = """<html><body>
 </body></html>"""
 
 DATA_URL = "data:text/html," + urllib.parse.quote(HTML)
+
+# Three inputs in document order. A keydown Tab (with or without Shift) is
+# recorded, then focusin writes `from->to` so the test can see both that Chrome
+# got a shift-modified Tab and that focus walked backwards.
+TAB_HTML = """<html><body>
+  <div id="picked"></div>
+  <input id="a" />
+  <input id="b" />
+  <input id="c" />
+  <script>
+    const picked = document.getElementById('picked');
+    let lastTab = null;
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Tab') {
+        lastTab = {shift: e.shiftKey, from: e.target.id};
+      }
+    });
+    document.addEventListener('focusin', e => {
+      if (lastTab) {
+        picked.textContent = (lastTab.shift ? 'shift-tab' : 'tab')
+          + ':' + lastTab.from + '->' + e.target.id;
+        lastTab = null;
+      }
+    });
+  </script>
+</body></html>"""
+
+TAB_URL = "data:text/html," + urllib.parse.quote(TAB_HTML)
 
 
 @pytest.fixture
@@ -95,3 +126,35 @@ async def test_ambiguous_selector_refused(session):
     # arbitrary one (the DOM moved under a snapshot that had validated one match).
     with pytest.raises(ValueError, match="matched 3 live elements"):
         await session.press_key(".row", "Enter", id=page["id"])
+
+
+@pytest.mark.asyncio
+async def test_shift_tab_is_a_real_shift_modified_tab(session):
+    blank = await session.new_blank_tab(max_tabs=10)
+    page = await session.navigate(TAB_URL, id=blank["id"])
+
+    # Focus #c then Shift+Tab: Chrome must report key=Tab + shiftKey, and focus
+    # must land on #b (reverse tab order), not #a or stay on #c.
+    res = await session.press_key("#c", "Shift+Tab", id=page["id"])
+    assert res["pressed"] is True
+    assert res["key"] == "Shift+Tab"
+
+    echo = await session.query_selector("#picked", id=page["id"])
+    assert echo["element"]["text"] == "shift-tab:c->b"
+
+
+@pytest.mark.asyncio
+async def test_shift_tab_without_selector_uses_current_focus(session):
+    blank = await session.new_blank_tab(max_tabs=10)
+    page = await session.navigate(TAB_URL, id=blank["id"])
+
+    # First press focuses #c and walks back to #b. The second omits the
+    # selector — retargeting #c would just repeat the first step — so this is
+    # the chatgpt.com "Shift+Tab twice" chain.
+    await session.press_key("#c", "Shift+Tab", id=page["id"])
+    res = await session.press_key(None, "Shift+Tab", id=page["id"])
+    assert res["pressed"] is True
+    assert res["key"] == "Shift+Tab"
+
+    echo = await session.query_selector("#picked", id=page["id"])
+    assert echo["element"]["text"] == "shift-tab:b->a"

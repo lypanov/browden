@@ -403,25 +403,32 @@ async def insert_text(css_selector: str, value: str, id: str) -> dict:
 
 @mcp.tool()
 @_tool
-async def press_key(css_selector: str, key: str, id: str) -> dict:
+async def press_key(key: str, id: str, css_selector: str | None = None) -> dict:
     """Focus an element on a tab and press a single control key — the press-key action.
 
     The keyboard counterpart of ``click``, for controls a coordinate click can't
     reach: elements the page made keyboard-operable (a ``tabindex`` list row, an
-    ARIA widget) rather than a ``<button>``/``<a>``. Four server-side gates, all
+    ARIA widget) rather than a ``<button>``/``<a>``. Also used to walk focus
+    (``Tab`` / ``Shift+Tab``) and then scroll the newly-focused pane
+    (``PageUp`` / ``Home``) without retargeting. Four server-side gates, all
     default-deny, must pass:
       1. The tab's host must be listed under the ``press-key`` section of the
          allowlist (and not on the denylist) — a section separate from ``click``
          and ``write-text``.
-      2. ``css_selector`` must resolve to exactly one element that is a real,
-         visible, non-decoy *focusable* control (natively focusable, or carrying
-         ``tabindex``). A bare ``<div onclick>`` with no ``tabindex`` is refused —
-         it isn't focusable. Integrity, not intent.
-      3. ``key`` must be a control key (Enter/Space/Tab/Escape/arrows/Home/End/
-         Page{Up,Down}) — never a character key; typing text is ``insert_text``'s
-         job, gated separately by field label.
-      4. Some page rule matching this URL must admit the control (its visible text
-         matches the rule ``label``) AND list ``key`` in that rule's ``keys``.
+      2. When ``css_selector`` is given, it must resolve to exactly one element
+         that is a real, visible, non-decoy *focusable* control (natively
+         focusable, or carrying ``tabindex``). A bare ``<div onclick>`` with no
+         ``tabindex`` is refused — it isn't focusable. Integrity, not intent.
+         Omit ``css_selector`` to press the key on the currently-focused
+         element (still host- and key-gated; used for a second ``Shift+Tab``
+         or a ``PageUp`` after focus has already moved).
+      3. ``key`` must be a control key (Enter/Space/Tab/Shift+Tab/Escape/arrows/
+         Home/End/Page{Up,Down}) — never a character key; typing text is
+         ``insert_text``'s job, gated separately by field label. The allowlist
+         spelling for reverse tab is exactly ``Shift+Tab``.
+      4. Some page rule matching this URL must list ``key`` in that rule's
+         ``keys``. When a selector was given, the control's visible text must
+         also match that rule's ``label``.
     Any gate failing raises a ValidationError and nothing is pressed.
     """
     logger.info(f"Tool called: press_key (css_selector={css_selector!r}, key={key!r}, id={id!r})")
@@ -434,11 +441,14 @@ async def press_key(css_selector: str, key: str, id: str) -> dict:
         return tab_gone_envelope(id)
     check_action_host(_access_rules_for(session), "press-key", url)  # raises if denied / host not allowed
 
-    # Gates 2-4: fetch the element (limit=2 so ambiguity is detectable), then let
-    # the validator judge focusability, the control-key rule, and the page label+key.
-    found = await session.query_selector_all(css_selector, id=id, limit=2)
-    if "error" in found:
-        return found
+    # Gates 2-4: when a selector is given, fetch the element (limit=2 so
+    # ambiguity is detectable). With no selector the key hits current focus
+    # and only the control-key + page-rule-keys checks run.
+    found = None
+    if css_selector:
+        found = await session.query_selector_all(css_selector, id=id, limit=2)
+        if "error" in found:
+            return found
     validate_press_key_target(_access_rules_for(session), url, css_selector, found, key)  # raises on any failed gate
 
     result = await session.press_key(css_selector, key, id=id)

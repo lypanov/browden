@@ -571,6 +571,7 @@ def test_allow_all_permits_every_write_action_on_any_page():
     # control keys the gate accepts (and no character keys — that gate is
     # separate and unmoved).
     assert "Enter" in scratch.rules_for("press-key", "anything.test", "/")[0].keys
+    assert "Shift+Tab" in scratch.rules_for("press-key", "anything.test", "/")[0].keys
     assert "a" not in scratch.rules_for("press-key", "anything.test", "/")[0].keys
 
 

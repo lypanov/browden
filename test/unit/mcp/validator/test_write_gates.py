@@ -144,12 +144,21 @@ def test_write_text_label_mismatch_rejected():
 
 # -- validate_press_key_target (Gates 2, 2b, 3) ------------------------------
 
-# cronometer.com press-key enabled: Enter + up/down arrows on the app path '/'.
+# cronometer.com press-key enabled: Enter + up/down arrows + Shift+Tab on '/'.
 _PK = BrowdenAccessRuleSet({
     "read": {"enabled": True, "tranco": {"enabled": False},
              "website_overrides": {"cronometer.com": [".*"]}},
     "press-key": {"cronometer.com": [
-        {"path": ["^/$"], "label": ".*", "keys": ["Enter", "ArrowDown", "ArrowUp"]},
+        {"path": ["^/$"], "label": ".*",
+         "keys": ["Enter", "ArrowDown", "ArrowUp", "Shift+Tab"]},
+    ]},
+})
+# Tab listed, Shift+Tab not — proving the chord is its own allowlist entry.
+_PK_TAB_ONLY = BrowdenAccessRuleSet({
+    "read": {"enabled": True, "tranco": {"enabled": False},
+             "website_overrides": {"cronometer.com": [".*"]}},
+    "press-key": {"cronometer.com": [
+        {"path": ["^/$"], "label": ".*", "keys": ["Tab"]},
     ]},
 })
 # same, but the rule only admits rows whose text starts with "Fried".
@@ -194,9 +203,34 @@ def test_press_key_character_key_rejected():
 
 
 def test_press_key_unlisted_control_key_rejected():
-    # Escape is a valid control key, but this rule only authorizes Enter/arrows.
+    # Escape is a valid control key, but this rule only authorizes Enter/arrows/Shift+Tab.
     with pytest.raises(ValidationError, match="no press-key rule authorizes"):
         validate_press_key_target(_PK, CRONO, "tr", _found(_row()), "Escape")
+
+
+def test_press_key_shift_tab_allowed_when_listed():
+    validate_press_key_target(_PK, CRONO, "tr", _found(_row()), "Shift+Tab")  # no raise
+
+
+def test_press_key_tab_does_not_authorize_shift_tab():
+    # Listing Tab is not listing the chord — default-deny per key name.
+    validate_press_key_target(_PK_TAB_ONLY, CRONO, "tr", _found(_row()), "Tab")
+    with pytest.raises(ValidationError, match="no press-key rule authorizes"):
+        validate_press_key_target(_PK_TAB_ONLY, CRONO, "tr", _found(_row()), "Shift+Tab")
+
+
+def test_press_key_no_selector_host_and_key_gated():
+    # No chosen element: skip focusability/label, still refuse an unlisted key
+    # and a character key, and allow a listed one (the chatgpt.com Shift+Tab
+    # / PageUp chain after focus has already moved).
+    validate_press_key_target(_PK, CRONO, None, None, "Shift+Tab")
+    validate_press_key_target(_PK, CRONO, "", None, "Shift+Tab")
+    with pytest.raises(ValidationError, match="no press-key rule authorizes"):
+        validate_press_key_target(_PK, CRONO, None, None, "Escape")
+    with pytest.raises(ValidationError, match="not an allowed control key"):
+        validate_press_key_target(_PK, CRONO, None, None, "a")
+    with pytest.raises(ValidationError, match="no press-key rule authorizes"):
+        validate_press_key_target(_PK_TAB_ONLY, CRONO, None, None, "Shift+Tab")
 
 
 def test_press_key_label_mismatch_rejected():
@@ -247,6 +281,7 @@ def test_allow_all_authorizes_a_control_key_but_never_a_character_key():
     node = {"tag": "tr", "id": None, "classes": [], "attributes": {"tabindex": "0"},
             "text": "A row"}
     validate_press_key_target(_SCRATCH, "https://unlisted.test/list", "tr", _found(node), "Enter")
+    validate_press_key_target(_SCRATCH, "https://unlisted.test/list", None, None, "Shift+Tab")
     with pytest.raises(ValidationError, match="not an allowed control key"):
         validate_press_key_target(_SCRATCH, "https://unlisted.test/list", "tr", _found(node), "a")
 
