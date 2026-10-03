@@ -5,11 +5,13 @@
 # ignored and the last valid version stays in force.
 #
 # A worked example that ENABLES the `press-key` write action. `press-key` focuses
-# an element and sends one CONTROL key (Enter/Space/Tab/Escape/arrows/…) — it is
-# how an agent operates controls a coordinate `click` can't reach: elements the
-# page made keyboard-operable with `tabindex` (list rows, ARIA widgets) rather
-# than a real <button>/<a>. The motivating case is a food-search result list whose
-# rows are `<tr tabindex="0">` picked with Enter (e.g. cronometer.com).
+# an element (or, with no selector, the currently-focused one) and sends one
+# CONTROL key (Enter/Space/Tab/Shift+Tab/Escape/arrows/…) — it is how an agent
+# operates controls a coordinate `click` can't reach: elements the page made
+# keyboard-operable with `tabindex` (list rows, ARIA widgets) rather than a real
+# <button>/<a>, and how it walks focus backwards (`Shift+Tab`) then scrolls a
+# pane (`PageUp`/`Home`). The original motivating case is a food-search result
+# list whose rows are `<tr tabindex="0">` picked with Enter (e.g. cronometer.com).
 #
 # Four independent layers, evaluated in this order for every URL/action:
 #   1. denylist        — always wins; a matching URL is refused outright.
@@ -36,17 +38,22 @@ read:
 # ---- write actions --------------------------------------------------------
 # `press-key`: focus + send one control key. Default-deny; every gate must pass:
 #   1. host+page — the host is listed here and some rule's `path` matches the page.
-#   2. focusable — the target is a real, visible, non-decoy element that is
-#      focusable (natively, or has `tabindex`). A bare <div onclick> is refused.
-#   3. control key — the pressed key is one of Enter / Space / Tab / Escape /
-#      ArrowUp|Down|Left|Right / Home / End / PageUp / PageDown. Character keys are
-#      NEVER allowed here (type text with `write-text`, gated by field label).
-#   4. label + key — a matching rule's `label` regex fully matches the control's
-#      visible text AND the pressed key is listed in that rule's `keys`.
+#   2. focusable — when a selector is given, the target is a real, visible,
+#      non-decoy element that is focusable (natively, or has `tabindex`). A bare
+#      <div onclick> is refused. Omit the selector to press the key on whatever
+#      already has focus (still host- and key-gated).
+#   3. control key — the pressed key is one of Enter / Space / Tab / Shift+Tab /
+#      Escape / ArrowUp|Down|Left|Right / Home / End / PageUp / PageDown.
+#      Character keys are NEVER allowed here (type text with `write-text`,
+#      gated by field label). The allowlist spelling for reverse tab is exactly
+#      `Shift+Tab` (not `Shift-Tab` or `shift+tab`).
+#   4. label + key — a matching rule lists the pressed key in `keys`. When a
+#      selector was given, that rule's `label` regex must also fully match the
+#      control's visible text.
 #
 # `keys` is REQUIRED for a press-key rule: a rule with no `keys` authorizes
 # nothing (fail-closed). Authority is per page AND per key — allowing Enter on a
-# page does not also allow Escape.
+# page does not also allow Escape, and allowing Tab does not also allow Shift+Tab.
 press-key:
   cronometer.com:
     # Cronometer is a hash-routed SPA: every logged-in view (diary, custom

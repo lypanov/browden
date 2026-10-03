@@ -93,9 +93,10 @@ class PageRule:
     match_on: str
     label: "re.Pattern[str] | None" = None
     field_ids: "frozenset[str]" = frozenset()
-    # `press-key` only: the control keys this rule authorizes on its pages (W3C
-    # `key` values, e.g. {"Enter", "ArrowDown"}). Empty for every other action —
-    # and a press-key rule with an empty set authorizes nothing (fail-closed).
+    # `press-key` only: the control keys this rule authorizes on its pages
+    # (ACTIVATION_KEYS spellings, e.g. {"Enter", "ArrowDown", "Shift+Tab"}).
+    # Empty for every other action — and a press-key rule with an empty set
+    # authorizes nothing (fail-closed).
     keys: "frozenset[str]" = frozenset()
 
     def matches_page(self, path: str, query: str = "", fragment: str = "",

@@ -138,6 +138,7 @@ verbatim; it is globally unique and routes itself to the right profile (multiple
 | `force_reload_tab` | Reload a tab and refresh its cached DOM |
 | `click` | **A write action, off by default** — click a control on a host listed in the `click` allowlist; each host declares a **required** `label` regex the control's visible text must fully match (`.*` to allow any). No host is listed out of the box. |
 | `insert_text` | **A write action, off by default** — type text into a single visible, non-readonly text field (`<textarea>`, a text `<input>`, or a `contenteditable`) on a host listed in the separate `write-text` allowlist section; the field's visible label (placeholder / aria-label / associated `<label>`) must fully match that host's **required** `label` regex. |
+| `press_key` | **A write action, off by default** — focus an element (or, with no `css_selector`, the current focus) and press one control key on a host listed under `press-key`. Each rule lists the exact `keys` it authorizes (`Enter`, `Tab`, `Shift+Tab`, arrows, `PageUp`/`Home`, …). |
 
 ## Profiles
 
@@ -218,14 +219,16 @@ The "allowlist" policy has **three layers**, evaluated in order (first match win
    so an open redirect on an allowlisted site (or a server-side 302) can't
    silently park the tab off-allowlist — an off-list landing resets the tab to
    `about:blank`.
-3. **write actions** — `click` and `insert_text` are both default-deny, each
-   gated by its **own** allowlist section (`click` and `write-text`), so
-   permitting typing never implies permitting clicks, or the reverse. Each action
-   must be enabled per domain. On each domain, the allowlist mandates a `label` regex, 
-   which must match the control's user-visible text (for `click`) or the field's user-visible label (for `insert_text`).
-   Any control can be explicitly enabled via `label: '.*'`. The
-   denylist vetoes both too; page-injected agent-targeted decoys are always
-   refused regardless of the label.
+3. **write actions** — `click`, `insert_text` and `press_key` are each default-deny,
+   gated by their **own** allowlist section (`click`, `write-text`, `press-key`), so
+   permitting typing never implies permitting clicks or keypresses, or the reverse.
+   Each action must be enabled per domain. On each domain, the allowlist mandates a
+   `label` regex, which must match the control's user-visible text (for `click` /
+   `press_key`) or the field's user-visible label (for `insert_text`).
+   `press-key` rules also list the exact control keys they authorize (`Enter`,
+   `Tab`, `Shift+Tab`, `PageUp`, …). Any control can be explicitly enabled via
+   `label: '.*'`. The denylist vetoes writes too; page-injected agent-targeted
+   decoys are always refused regardless of the label.
 
 
 To refresh the Tranco snapshot, use `python3 setup/fetch_tranco.py` and restart the MCP server.

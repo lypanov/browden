@@ -46,9 +46,13 @@ _NATIVELY_FOCUSABLE = ("input", "button", "select", "textarea")
 # keys, NEVER character keys. Typing text is `write-text`'s job (gated by field
 # label); routing characters through press-key would be a text-entry channel that
 # skips that gate, so the gate refuses any key outside this set. Names are the
-# W3C UI Events `key` values the operator writes in the allowlist `keys:` list.
+# W3C UI Events `key` values the operator writes in the allowlist `keys:` list,
+# plus the one named chord ``Shift+Tab`` (reverse tab-order traversal — W3C
+# still reports ``key: "Tab"`` with ``shiftKey``, so the chord needs its own
+# allowlist spelling).
 ACTIVATION_KEYS = frozenset({
     "Enter", "Space", "Tab", "Escape",
+    "Shift+Tab",
     "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
     "Home", "End", "PageUp", "PageDown",
 })

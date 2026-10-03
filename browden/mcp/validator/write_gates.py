@@ -1,4 +1,4 @@
-"""The full default-deny gate sequences for the write actions (``click`` / ``insert_text``).
+"""The full default-deny gate sequences for the write actions (``click`` / ``insert_text`` / ``press_key``).
 
 Composes the three lower-level pieces — the per-action host allowlist (in the
 :class:`BrowdenAccessRuleSet` each gate is handed), the URL gate
@@ -137,25 +137,16 @@ def validate_write_text_target(access_rules: BrowdenAccessRuleSet, url: str,
             f"{p.hostname or ''}{p.path or '/'} — refusing to insert text")
 
 
-def validate_press_key_target(access_rules: BrowdenAccessRuleSet, url: str,
-                              css_selector: str, found: dict, key: str) -> None:
-    """Gates 2, 2b and 3 for ``press-key`` — focusability, control-key, then label+key.
+def _press_key_authorized(access_rules: BrowdenAccessRuleSet, url: str, key: str,
+                          node: dict | None) -> None:
+    """Gate 2b + 3 for ``press-key``: control-key universe, then the page rule.
 
-    ``url`` is the tab's live URL; ``found`` is the ``query_selector_all(limit=2)``
-    result for ``css_selector``; ``key`` is the W3C ``key`` value the caller wants
-    to send. Raises :class:`ValidationError` on the first failing gate; returns
-    ``None`` when the key press is authorized. Gate 1 (host + page section) is run
-    by :func:`check_action_host` in the tool, exactly as for ``click``.
+    ``node`` is the targeted element, or ``None`` when the caller is sending the
+    key to the currently-focused element (no selector). A missing node skips the
+    label match — there is no chosen control — but the key must still be in
+    :data:`ACTIVATION_KEYS` and listed on a matching page rule. ``Tab`` does not
+    authorize ``Shift+Tab``; each name is its own allowlist entry.
     """
-    # Gate 2: the element must be a single, real, visible, non-decoy *focusable*
-    # control (natively focusable or tabindex) — the keyboard analogue of the
-    # is_clickable_control integrity check.
-    node = _single_node(found, css_selector, "refusing to press a key")
-    if not is_focusable_control(node):
-        raise ValidationError(
-            "selected element is not a focusable control (or is a "
-            "hidden/disabled/decoy element) — refusing to press a key")
-
     # Gate 2b: only control keys ever go through press-key. Character keys are
     # refused outright — typing text is write-text's job (gated by field label);
     # letting characters through here would be a text-entry channel that skips it.
@@ -164,14 +155,55 @@ def validate_press_key_target(access_rules: BrowdenAccessRuleSet, url: str,
             f"key {key!r} is not an allowed control key — press-key sends only "
             f"{sorted(ACTIVATION_KEYS)}; type text with insert_text instead")
 
-    # Gate 3: some page rule matching THIS url must both admit the control (its
-    # visible-text label matches) AND list this key. Authority is per page and per
-    # key — a rule that allows Enter on the picker doesn't thereby allow Escape,
-    # and one that allows a control here does not leak onto another page.
+    # Gate 3: some page rule matching THIS url must list this key. When a
+    # control was chosen, that rule must also admit it (visible-text label
+    # matches). Authority is per page and per key — a rule that allows Enter
+    # on the picker doesn't thereby allow Escape or Shift+Tab, and one that
+    # allows a control here does not leak onto another page.
     p = urlparse(url)
     rules = access_rules.rules_for("press-key", p.hostname or "", p.path, p.query, p.fragment)
-    if not any(r.label is not None and label_matches(node, r.label) and key in r.keys
-               for r in rules):
+    if node is None:
+        authorized = any(key in r.keys for r in rules)
+        target = "the focused element"
+    else:
+        authorized = any(
+            r.label is not None and label_matches(node, r.label) and key in r.keys
+            for r in rules)
+        target = "this control"
+    if not authorized:
         raise ValidationError(
-            f"no press-key rule authorizes key {key!r} on this control for "
+            f"no press-key rule authorizes key {key!r} on {target} for "
             f"{p.hostname or ''}{p.path or '/'} — refusing to press a key")
+
+
+def validate_press_key_target(access_rules: BrowdenAccessRuleSet, url: str,
+                              css_selector: str | None, found: dict | None,
+                              key: str) -> None:
+    """Gates 2, 2b and 3 for ``press-key`` — focusability, control-key, then label+key.
+
+    ``url`` is the tab's live URL; ``key`` is the allowlist spelling (a W3C
+    ``key`` value, or ``Shift+Tab``). When ``css_selector`` is set, ``found`` is
+    the ``query_selector_all(limit=2)`` result and Gate 2 requires a single
+    focusable control. When ``css_selector`` is omitted (``None`` / empty) the
+    key is sent to the currently-focused element: Gate 2 and the label half of
+    Gate 3 are skipped, but the host (Gate 1, in the tool) and the key itself
+    stay default-deny. Raises :class:`ValidationError` on the first failing
+    gate; returns ``None`` when the key press is authorized. Gate 1 (host +
+    page section) is run by :func:`check_action_host` in the tool, exactly as
+    for ``click``.
+    """
+    if not css_selector:
+        _press_key_authorized(access_rules, url, key, node=None)
+        return
+
+    # Gate 2: the element must be a single, real, visible, non-decoy *focusable*
+    # control (natively focusable or tabindex) — the keyboard analogue of the
+    # is_clickable_control integrity check.
+    node = _single_node(found or {"total_count": 0, "elements": []},
+                        css_selector, "refusing to press a key")
+    if not is_focusable_control(node):
+        raise ValidationError(
+            "selected element is not a focusable control (or is a "
+            "hidden/disabled/decoy element) — refusing to press a key")
+
+    _press_key_authorized(access_rules, url, key, node)

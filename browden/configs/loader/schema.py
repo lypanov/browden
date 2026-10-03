@@ -18,6 +18,8 @@ The expected shape (see configs/samples/read_only_on_popular_websites.yaml):
         label: <regex>               # REQUIRED: visible text must fully match
                                      #   (use '.*' to allow any control on the host)
         paths: [<path regex>, ...]   # optional, defaults to [".*"]
+        keys: [<name>, ...]          # press-key only: ACTIVATION_KEYS names
+                                     #   (Enter, Tab, Shift+Tab, PageUp, …)
 
     profiles:                     # per-browser-profile rule sets (additive over
       <profile dir>:              #   the global ones above)
@@ -40,6 +42,7 @@ import re
 from pathlib import Path
 
 from ...mcp.validator.allowlist import WRITE_ACTIONS
+from ...mcp.validator.intent import ACTIVATION_KEYS
 
 # Top-level sections that are not write actions, each checked by its own branch.
 _OTHER_SECTIONS = ("denylist", "read", "infra", "profiles")
@@ -87,14 +90,20 @@ def _check_field_ids(fids, where: str) -> None:
 
 
 def _check_keys(keys, where: str) -> None:
-    # A shape check only: the control-key allowlist (validator.ACTIVATION_KEYS) is
-    # enforced at action time by the press-key gate, which refuses any non-control
-    # key regardless of config — so a typo'd key here just never authorizes; it is
-    # never a way to send a character key.
+    # Shape + membership: every name must be one of validator.ACTIVATION_KEYS
+    # (Enter/Tab/Shift+Tab/arrows/…). A typo or a character key fails the load
+    # rather than sitting inert — the press-key gate would refuse it at action
+    # time anyway, but an operator adding ``Shift+Tab`` should learn at save
+    # time if they spelled it ``Shift-Tab``.
     if not isinstance(keys, list) or not keys or not all(isinstance(x, str) and x for x in keys):
         raise ConfigError(
             f"{where}.keys: must be a non-empty list of control-key names "
-            f"(e.g. ['Enter', 'ArrowDown'])")
+            f"(e.g. ['Enter', 'ArrowDown', 'Shift+Tab'])")
+    unknown = [k for k in keys if k not in ACTIVATION_KEYS]
+    if unknown:
+        raise ConfigError(
+            f"{where}.keys: unknown control key(s) {unknown}; "
+            f"allowed: {sorted(ACTIVATION_KEYS)}")
 
 
 def _check_page_rule(rule, where: str, *, want_label: bool, allow_field_ids: bool,

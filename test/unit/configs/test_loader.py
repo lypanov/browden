@@ -108,7 +108,7 @@ def test_press_key_sample_is_valid():
 
 def test_load_press_key_rule_keys(tmp_path):
     # The full file path: schema-validate a press-key rule and parse its `keys`
-    # into PageRule.keys.
+    # into PageRule.keys. Shift+Tab is a first-class name, not a typo of Tab.
     f = tmp_path / "allowlist.yaml"
     f.write_text(
         'read:\n  website_overrides: {"*": [".*"]}\n'
@@ -116,11 +116,11 @@ def test_load_press_key_rule_keys(tmp_path):
         "  cronometer.com:\n"
         "    - path: ['^/$']\n"
         "      label: '.*'\n"
-        "      keys: ['Enter', 'ArrowDown']\n"
+        "      keys: ['Enter', 'ArrowDown', 'Shift+Tab']\n"
     )
     rc = load_runtime_configuration(f)
     (rule,) = rc.access_rules.rules_for("press-key", "cronometer.com", "/")
-    assert rule.keys == frozenset({"Enter", "ArrowDown"})
+    assert rule.keys == frozenset({"Enter", "ArrowDown", "Shift+Tab"})
 
 
 @pytest.mark.parametrize("action", WRITE_ACTIONS)
@@ -240,6 +240,11 @@ def test_load_page_scoped_rules(tmp_path):
      "non-empty list"),
     ('press-key:\n  x.com:\n    - path: [".*"]\n      label: ".*"\n      keys: "Enter"\n',
      "non-empty list"),
+    # and each name must be an ACTIVATION_KEYS spelling (Shift+Tab, not Shift-Tab)
+    ('press-key:\n  x.com:\n    - path: [".*"]\n      label: ".*"\n      keys: ["Shift-Tab"]\n',
+     "unknown control key"),
+    ('press-key:\n  x.com:\n    - path: [".*"]\n      label: ".*"\n      keys: ["a"]\n',
+     "unknown control key"),
     # read override page rules may not carry a label
     ('read:\n  website_overrides:\n    x.com:\n      - path: [".*"]\n        label: ".*"\n',
      "unknown keys"),
