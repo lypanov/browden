@@ -369,6 +369,32 @@ def test_is_running_false_and_tears_down_a_dead_session():
 
 @patch("browden.web_navigator.selenium_chrome.backend._launch_chrome")
 @patch("browden.web_navigator.selenium_chrome.backend.webdriver")
+def test_list_handles_relaunches_a_dead_browser_and_is_running_does_not(
+        mock_webdriver, mock_launch):
+    """The resurrection mechanism behind the idle reaper.
+
+    ``sweep_idle`` always enumerates with ``list_handles``. That goes through
+    ``_drv``, which starts Chrome when the attached session is dead.
+    ``is_running`` is the look-only probe ``list_tabs`` uses, and it must not.
+    No real Chrome: ``_launch_chrome`` and ``webdriver.Chrome`` are mocked.
+    """
+    _patch_launch(mock_launch)
+    dead = _make_fake_driver(dead=True)
+    alive = _make_fake_driver(handles=("h1",))
+    mock_webdriver.Chrome.return_value = alive
+    backend = _backend_with_driver(dead)
+
+    assert backend.is_running() is False
+    mock_launch.assert_not_called()
+    mock_webdriver.Chrome.assert_not_called()
+
+    assert backend.list_handles() == ["h1"]
+    mock_launch.assert_called_once()
+    mock_webdriver.Chrome.assert_called_once()
+
+
+@patch("browden.web_navigator.selenium_chrome.backend._launch_chrome")
+@patch("browden.web_navigator.selenium_chrome.backend.webdriver")
 def test_drv_recreates_when_window_handles_fails(mock_webdriver, mock_launch):
     _patch_launch(mock_launch)
     # Driver that fails on window_handles (session dead)

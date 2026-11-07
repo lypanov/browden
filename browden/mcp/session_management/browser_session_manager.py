@@ -44,7 +44,7 @@ from collections.abc import Callable
 
 from ...common.logger import logger
 from ...dom import query, serialize
-from ..validator.allowlist import DEFAULT_REAP_INTERVAL_SECONDS
+from ..validator.allowlist import DEFAULT_REAP_IDLE_TABS, DEFAULT_REAP_INTERVAL_SECONDS
 from ..validator.errors import SessionBusyError, tab_gone_envelope
 from ...web_navigator.interface import TabNotFoundError
 from ...web_navigator.tab_id import format_tab_id, split_tab_id
@@ -67,16 +67,19 @@ class _AtTabCap(Exception):
 
 class BrowserSessionManager:
     def __init__(self, backend, *, namespace: str, clock=time.monotonic, start_reaper: bool = True,
-                 reap_interval_seconds: Callable[[], float] = lambda: DEFAULT_REAP_INTERVAL_SECONDS):
-        # reap_interval_seconds is a getter, not a number: the reaper reads it
-        # once per tick, so an ``infra.reap_interval_seconds`` edit takes effect
-        # on the next wake-up like every other live-reloaded setting, without
-        # restarting the server or the session.
+                 reap_interval_seconds: Callable[[], float] = lambda: DEFAULT_REAP_INTERVAL_SECONDS,
+                 reap_idle_tabs: Callable[[], bool] = lambda: DEFAULT_REAP_IDLE_TABS):
+        # Both are getters, not snapshots: the reaper reads them once per tick,
+        # so an ``infra`` edit takes effect on the next wake-up like every other
+        # live-reloaded setting. ``reap_idle_tabs`` false means do not run the
+        # periodic task at all — its tick calls ``list_handles``, and listing a
+        # dead browser relaunches Chrome.
         self._backend = backend
         self._namespace = namespace
         self._cache = SoupCache(clock=clock)
         self._registry = TabRegistry(clock=clock)
         self._reap_interval_seconds = reap_interval_seconds
+        self._reap_idle_tabs = reap_idle_tabs
         # Serializes every driver touch in this session (tools AND cleanup).
         self._lock = asyncio.Lock()
         self._reaper_task: asyncio.Task | None = None
@@ -524,22 +527,70 @@ class BrowserSessionManager:
             self._cache.invalidate(handle)
             self._registry.forget(handle)
 
-    def start_reaper(self) -> asyncio.Task:
-        """Create the periodic reaper task (idempotent). Requires a running event loop."""
+    def _periodic_sweep_enabled(self) -> bool:
+        """Whether the background idle sweep should keep a task alive.
+
+        ``infra.reap_idle_tabs: false`` is the supported opt-out. A non-positive
+        interval is not a config value (the schema rejects it) but is treated
+        as off here too: the loop sleeps that interval, and ``sleep(0)`` would
+        busy-loop into ``list_handles``, relaunching Chrome on every iteration.
+        """
+        if not self._reap_idle_tabs():
+            return False
+        return self._reap_interval_seconds() > 0
+
+    def _stop_reaper_disabled(self) -> None:
+        """Drop the periodic task without sweeping.
+
+        Called from inside the reaper coroutine. Clearing the handle here is
+        what makes the opt-out real: a finished-but-still-referenced task is
+        not a running sweep, and ``close`` stays safe if the handle is already
+        gone. Not cancelled — this coroutine is returning on its own.
+        """
+        logger.info(
+            "Periodic idle-tab sweep disabled; reaper exiting without touching the browser")
+        self._reaper_task = None
+
+    def start_reaper(self) -> asyncio.Task | None:
+        """Create the periodic reaper task (idempotent). Requires a running event loop.
+
+        Returns None without creating a task when the periodic sweep is
+        disabled. The explicit at-cap reclaim in ``new_blank_tab`` does not
+        go through here and still runs.
+        """
+        if not self._periodic_sweep_enabled():
+            logger.info(
+                "Periodic idle-tab sweep disabled; the reaper task will not run")
+            return None
         if self._reaper_task is None:
             self._reaper_task = asyncio.create_task(self._reaper_loop())
         return self._reaper_task
 
     async def _reaper_loop(self) -> None:
-        """Sweep on a fixed cadence — the only thing that runs the sweep.
+        """Sweep on a fixed cadence — the only periodic thing that runs the sweep.
 
-        The interval is re-read every tick, so an ``infra.reap_interval_seconds``
-        edit lands on the next wake-up without a restart. A sweep that raises
-        must never kill the loop: the session would then keep its idle tabs
-        forever, so the failure is swallowed and the next tick tries again.
+        The interval and the enable flag are re-read every tick, so an ``infra``
+        edit lands on the next wake-up without a restart. A disable observed
+        before the sweep returns without calling ``list_handles``: that call
+        relaunches a Chrome the user has closed. A sweep that raises must never
+        kill the loop while the sweep is still enabled: the session would then
+        keep its idle tabs forever, so that failure is swallowed and the next
+        tick tries again.
+
+        Turning the sweep back on after this task has exited needs a new
+        session (a process restart). An already-cached session does not spawn
+        a reaper it never started, or one that has already stopped.
         """
         while True:
+            if not self._periodic_sweep_enabled():
+                self._stop_reaper_disabled()
+                return
             await asyncio.sleep(self._reap_interval_seconds())
+            # The flag may have flipped during the sleep. Do not sweep on the
+            # way out: that sweep is the Chrome relaunch.
+            if not self._periodic_sweep_enabled():
+                self._stop_reaper_disabled()
+                return
             try:
                 await self._sweep_idle_locked()
             except Exception:

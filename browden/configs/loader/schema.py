@@ -23,6 +23,8 @@ The expected shape (see configs/samples/read_only_on_popular_websites.yaml):
       max_browser_sessions: <positive int>
       max_tabs_per_session: <positive int>
       reap_interval_seconds: <positive int>   # how often idle tabs are swept
+      reap_idle_tabs: <bool>                  # default true; false disables
+                                              # the periodic sweep entirely
 
 Validation is structural plus regex compilation; semantics (default-deny,
 denylist-wins ordering, www-stripping, ...) live in ActionAllowlist/ReadPolicy.
@@ -179,6 +181,13 @@ def validate_allowlist_data(data, *, source: str = "allowlist") -> dict:
             if not isinstance(rules, dict):
                 raise ConfigError(f"{source}: infra must be a mapping, got {type(rules).__name__}")
             for name, value in rules.items():
+                if name == "reap_idle_tabs":
+                    # A bool, not a duration. Zero is not the off switch: the
+                    # reaper sleeps its interval, and sleep(0) would busy-loop.
+                    if not isinstance(value, bool):
+                        raise ConfigError(
+                            f"{source}: infra.reap_idle_tabs must be a boolean, got {value!r}")
+                    continue
                 if name not in {"max_browser_sessions", "max_tabs_per_session",
                                 "reap_interval_seconds"}:
                     raise ConfigError(f"{source}: unknown infra key {name}")

@@ -59,10 +59,17 @@ infra:
   max_tabs_per_session: 20
   # How often (seconds) the idle sweep runs: it closes tabs the agent
   # hasn't touched in an hour, and forgets tabs closed in the browser.
-  # It is the ONLY cleanup pass — tool calls never sweep — so a tab is
-  # closed between 1h and 1h + this interval after its last use. Lower it
-  # to reclaim tabs sooner, raise it to leave a long-running window alone.
+  # It is the ONLY periodic cleanup pass — tool calls never sweep — so a
+  # tab is closed between 1h and 1h + this interval after its last use.
+  # Lower it to reclaim tabs sooner, raise it to leave a long-running
+  # window alone.
   reap_interval_seconds: 7200
+  # Set false to disable that periodic pass entirely. Listing tabs on a
+  # dead browser starts Chrome, so the sweep relaunches a window the user
+  # closed. Explicit browser requests still start Chrome, and opening a
+  # tab at the per-session cap still reclaims idle ones. Default is true.
+  # Restart the server after changing it.
+  # reap_idle_tabs: false
 
 # >>> browden provenance — auto-written by setup; do not edit by hand >>>
 # Fingerprints the exact data snapshots that define this read perimeter, so

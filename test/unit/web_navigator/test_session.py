@@ -100,6 +100,63 @@ class FakeBackend:
         return b"\x89PNG\r\n\x1a\nfakepng"
 
 
+class RelaunchingBackend(FakeBackend):
+    """Models SeleniumChromeBackend's launch rule, without starting Chrome.
+
+    Driving calls (``list_handles``, ``new_blank_tab``, ``select_tab``,
+    ``navigate``, ``list_tabs``) go through ``_drv`` and start a dead browser.
+    ``is_running`` only looks, and must not.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.running = False
+        self.launches = 0
+        self.live: set[str] = set()
+
+    def _launch(self) -> None:
+        if not self.running:
+            self.launches += 1
+            self.running = True
+            if not self.live:
+                self.live.add("h1")
+
+    def is_running(self):
+        self.calls.append("is_running")
+        return self.running
+
+    def list_handles(self):
+        self.calls.append("list_handles")
+        self._launch()
+        return list(self.live)
+
+    def list_tabs(self):
+        self.calls.append("list_tabs")
+        self._launch()
+        return [TabInfo(handle=h, url="about:blank", title="t", selected=True,
+                        profile_dir=self.profile_dir) for h in self.live]
+
+    def new_blank_tab(self):
+        self.calls.append("new_blank_tab")
+        self._launch()
+        handle = f"h{len(self.live) + 1}"
+        self.live.add(handle)
+        return TabInfo(handle=handle, url="about:blank", title="t", selected=True,
+                       profile_dir=self.profile_dir)
+
+    def select_tab(self, handle):
+        self.calls.append(("select_tab", handle))
+        self._launch()
+        self._check(handle)
+        self.active = handle
+
+    def navigate(self, url):
+        self.calls.append(("navigate", url))
+        self._launch()
+        return TabInfo(handle=self.active, url=url, title="t", selected=True,
+                       profile_dir=self.profile_dir)
+
+
 def make_session(backend=None, clock=None):
     """Tests that don't manipulate time can omit ``clock``; sweep_idle tests pass a
     ``fake_clock()`` instance so they can ``clock.t += seconds`` to advance."""
@@ -650,6 +707,113 @@ def test_sweep_idle_reconciles_against_live_tabs(fake_clock):
     assert backend.closed == []  # reconciliation never closes anything
 
 
+def _disabled_manager(backend, clock=None):
+    """The server's opt-out shape: asked to start a reaper, config says no."""
+    return BrowserSessionManager(
+        backend, namespace="ns", clock=clock or time.monotonic, start_reaper=True,
+        reap_idle_tabs=lambda: False,
+    )
+
+
+def test_periodic_reaper_is_not_started_when_idle_sweep_is_disabled():
+    s = _disabled_manager(RelaunchingBackend())
+    assert s._reaper_task is None
+
+
+@pytest.mark.asyncio
+async def test_disabled_reaper_loop_does_not_list_handles_or_launch():
+    """Housekeeping must not run, even if the loop is entered.
+
+    An idle tracked tab is the case the sweep exists for. With the opt-out it
+    is left alone, and ``list_handles`` — the call that relaunches Chrome —
+    is never made.
+    """
+    backend = RelaunchingBackend()
+    s = _disabled_manager(backend)
+    s._registry.touch("old")
+
+    await s._reaper_loop()
+
+    assert s._reaper_task is None
+    assert backend.launches == 0
+    assert "list_handles" not in backend.calls
+    assert "old" in s._registry._last_access
+
+
+@pytest.mark.asyncio
+async def test_reaper_does_not_sweep_when_disabled_during_its_sleep(monkeypatch):
+    """A flag flip during the sleep must not sweep on the way out.
+
+    The task is already asleep (up to one whole interval). When it wakes, the
+    config now says off. Sweeping anyway would be the Chrome relaunch the
+    opt-out exists to stop.
+    """
+    backend = RelaunchingBackend()
+    enabled = {"on": True}
+
+    async def fake_sleep(_seconds):
+        enabled["on"] = False
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    s = BrowserSessionManager(
+        backend, namespace="ns", start_reaper=False,
+        reap_idle_tabs=lambda: enabled["on"],
+    )
+    s._registry.touch("old")
+
+    await s._reaper_loop()
+
+    assert backend.launches == 0
+    assert "list_handles" not in backend.calls
+    assert s._reaper_task is None
+
+
+@pytest.mark.asyncio
+async def test_enabled_reaper_tick_still_sweeps(monkeypatch):
+    """The default — sweep on — still enumerates tabs on each tick."""
+    backend = FakeBackend()
+    slept = {"n": 0}
+
+    async def fake_sleep(_seconds):
+        slept["n"] += 1
+        if slept["n"] >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    s = make_session(backend)
+    with pytest.raises(asyncio.CancelledError):
+        await s._reaper_loop()
+    assert "list_handles" in backend.calls
+
+
+@pytest.mark.asyncio
+async def test_explicit_ops_launch_and_passive_probe_does_not_when_reaper_disabled():
+    """Chrome still starts for a real browser operation, and only for one.
+
+    ``is_live`` is what ``list_tabs`` uses to skip a dead session. ``navigate``
+    and ``new_blank_tab`` are explicit and must go through the launch path.
+    """
+    backend = RelaunchingBackend()
+    s = _disabled_manager(backend)
+    assert s._reaper_task is None
+
+    assert await s.is_live() is False
+    assert backend.launches == 0
+    assert "list_handles" not in backend.calls
+
+    tab = await s.new_blank_tab(max_tabs=10)
+    assert backend.launches >= 1
+    opened = backend.launches
+
+    backend.running = False  # the user closed Chrome
+    assert await s.is_live() is False
+    assert backend.launches == opened
+    assert backend.calls.count("list_handles") == 1  # only the explicit open's cap check
+
+    await s.navigate("https://example.test/", id=tab["id"])
+    assert backend.launches > opened
+
+
 def test_sweep_idle_skips_reconcile_when_enumeration_fails():
     backend = FakeBackend()
     backend.live = None  # list_handles raises
@@ -735,6 +899,28 @@ async def test_the_cap_sweep_only_runs_when_the_session_is_full():
 
     # One list_handles: the cap check itself. A sweep would add a second.
     assert backend.calls.count("list_handles") == 1
+
+
+@pytest.mark.asyncio
+async def test_tab_cap_reclaim_still_runs_when_periodic_reaper_is_disabled(fake_clock):
+    """The opt-out stops the timer, not the explicit at-cap reclaim.
+
+    ``new_blank_tab`` is the one sweep outside the reaper. A full session
+    whose tabs have gone idle must still free a slot and open the new tab.
+    """
+    backend = LiveCountBackend()
+    clock = fake_clock()
+    s = _disabled_manager(backend, clock=clock)
+    assert s._reaper_task is None
+    s._registry.touch("h1")
+
+    await s.new_blank_tab(max_tabs=2)  # fills the session to its cap
+    clock.t += IDLE_TTL_SECONDS + 1
+
+    opened = await s.new_blank_tab(max_tabs=2)
+
+    assert opened["id"].endswith("-h3")
+    assert set(backend.closed) == {"h1", "h2"}
 
 
 @pytest.mark.asyncio

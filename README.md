@@ -298,6 +298,16 @@ Key points of the flow:
   tool call — that closes tabs the agent hasn't touched in an hour and forgets
   tabs the human closed in the browser. A tab is therefore closed between 1h and
   1h + one interval after its last use; only *agent* activity counts as use.
+  That pass is also what relaunches a Chrome the user has closed: the tick
+  lists tabs, and listing a dead browser starts a new one. Set
+  `infra.reap_idle_tabs: false` to disable the periodic task. The default is
+  `true`, so an existing config keeps the sweep until the key is set. Explicit
+  browser requests still start Chrome, and `new_blank_tab` still reclaims idle
+  tabs when the session is at its cap. Restart the server after changing the
+  key. A reaper already asleep will not sweep when it wakes, but only a
+  restart stops that sleep immediately, and turning the sweep back on needs a
+  restart too: a session does not spawn a reaper it never started or that has
+  already exited.
 - **The backend** is the only code that imports a browser library. It launches
   Chrome *itself* — a plain `google-chrome --user-data-dir=… --remote-debugging-
   port=…` subprocess — and *attaches* Selenium over the DevTools port. It

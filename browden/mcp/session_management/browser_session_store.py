@@ -20,7 +20,11 @@ from collections.abc import Callable
 from ...common.logger import logger
 from ...web_navigator.interface import WebNavigatorBackend
 from ...web_navigator.tab_id import split_tab_id
-from .browser_session_manager import DEFAULT_REAP_INTERVAL_SECONDS, BrowserSessionManager
+from .browser_session_manager import (
+    DEFAULT_REAP_IDLE_TABS,
+    DEFAULT_REAP_INTERVAL_SECONDS,
+    BrowserSessionManager,
+)
 
 
 class UnknownTabError(LookupError):
@@ -63,6 +67,7 @@ class BrowserSessionStore:
     def get_or_create_session(
             self, backend: WebNavigatorBackend, max_sessions: int,
             reap_interval_seconds: Callable[[], float] = lambda: DEFAULT_REAP_INTERVAL_SECONDS,
+            reap_idle_tabs: Callable[[], bool] = lambda: DEFAULT_REAP_IDLE_TABS,
     ) -> BrowserSessionManager:
         """Cache (and return) the coordinator for ``backend``'s profile.
 
@@ -78,10 +83,13 @@ class BrowserSessionStore:
         the reaper. Runs synchronously on the single event loop (no await between
         lookup and insert), so get-then-set cannot interleave.
 
-        ``reap_interval_seconds`` is passed through to the new session's reaper as
-        a *getter* so it keeps tracking the live config (the caller reads it off
-        the hot-reloaded allowlist); an already-cached session keeps the getter it
-        was built with — which is the same live one.
+        ``reap_interval_seconds`` and ``reap_idle_tabs`` are passed through to the
+        new session's reaper as *getters* so they keep tracking the live config
+        (the caller reads them off the hot-reloaded allowlist); an already-cached
+        session keeps the getters it was built with — which are the same live
+        ones. ``reap_idle_tabs`` false means the session does not start the
+        periodic task. An explicit ``new_blank_tab`` that hits the tab cap still
+        sweeps; that path is not the periodic task.
         """
         key = str(backend.get_profile_dir())
         digest = self.digest_for(key)
@@ -91,7 +99,8 @@ class BrowserSessionStore:
                 raise RuntimeError(f"Cannot start a new browser session (limit of {max_sessions} reached)")
             logger.info(f"Initializing BrowserSessionManager (profile={key})")
             session = BrowserSessionManager(backend, namespace=digest,
-                                            reap_interval_seconds=reap_interval_seconds)
+                                            reap_interval_seconds=reap_interval_seconds,
+                                            reap_idle_tabs=reap_idle_tabs)
             self._sessions[digest] = session
             if not self._atexit_registered:
                 atexit.register(self._shutdown)

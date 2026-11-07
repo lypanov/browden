@@ -20,6 +20,8 @@ def test_sample_config_gates_reads_by_tranco_and_denies_writes():
     assert not al.is_denied("google.com", "/")                     # denylist empty
     assert not al.section("click").is_allowed("amazon.com", "/dp/X")
     assert al.rules_for("click", "amazon.com", "/dp/X") == []
+    # The sample documents the opt-out but leaves the periodic sweep on.
+    assert al.reap_idle_tabs is True
 
 
 def test_load_builds_working_allowlist(tmp_path):
@@ -233,6 +235,9 @@ def test_load_page_scoped_rules(tmp_path):
     ("infra:\n  max_tabs_per_session: -1\n", "must be a positive integer"),
     ("infra:\n  reap_interval_seconds: 0\n", "must be a positive integer"),
     ("infra:\n  reap_interval_secs: 60\n", "unknown infra key"),
+    # Zero is not the off switch, and a string is not a bool.
+    ("infra:\n  reap_idle_tabs: 0\n", "must be a boolean"),
+    ("infra:\n  reap_idle_tabs: 'false'\n", "must be a boolean"),
 ])
 def test_schema_violations_raise_config_error(tmp_path, content, match):
     f = tmp_path / "allowlist.yaml"
@@ -242,6 +247,23 @@ def test_schema_violations_raise_config_error(tmp_path, content, match):
 
 
 # -- path resolution ----------------------------------------------------------
+
+def test_reap_idle_tabs_false_disables_the_periodic_sweep(tmp_path):
+    """The opt-out loads, and does not disturb the sweep interval."""
+    f = tmp_path / "allowlist.yaml"
+    f.write_text("infra:\n  reap_idle_tabs: false\n  reap_interval_seconds: 600\n")
+    al = load_allowlist(f)
+    assert al.reap_idle_tabs is False
+    assert al.reap_interval_seconds == 600
+
+
+def test_reap_idle_tabs_true_is_explicitly_on(tmp_path):
+    f = tmp_path / "allowlist.yaml"
+    f.write_text("infra:\n  reap_idle_tabs: true\n")
+    al = load_allowlist(f)
+    assert al.reap_idle_tabs is True
+    assert al.reap_interval_seconds == 7200
+
 
 def test_resolve_explicit_beats_everything(monkeypatch, tmp_path):
     monkeypatch.setenv("BROWDEN_ALLOWLIST", str(tmp_path / "env.yaml"))

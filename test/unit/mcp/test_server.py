@@ -275,6 +275,165 @@ async def test_new_blank_tab_hands_the_session_a_live_reap_interval(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_new_blank_tab_hands_the_session_a_live_reap_idle_tabs_flag(monkeypatch):
+    """``infra.reap_idle_tabs`` reaches the session as a live getter.
+
+    Same contract as the interval: a hot reload must be visible to the reaper
+    on its next read, not frozen at whatever the flag was when the session
+    happened to be created.
+    """
+    import browden.mcp.server as server
+    from browden.configs.loader import AllowlistRefresher
+    from browden.mcp.validator import ActionAllowlist
+    importlib.reload(server)
+
+    session = _fake_session(new_blank_tab={"id": "pre-h1"})
+    with patch.object(server._store, "get_or_create_session", return_value=session) as get_session:
+        monkeypatch.setattr(server, "_refresher", AllowlistRefresher.static(
+            ActionAllowlist({"infra": {"reap_idle_tabs": False, "reap_interval_seconds": 600}})))
+        await server.new_blank_tab(profile_dir=None)
+
+        flag = get_session.call_args.kwargs["reap_idle_tabs"]
+        assert flag() is False
+
+        monkeypatch.setattr(server, "_refresher", AllowlistRefresher.static(
+            ActionAllowlist({"infra": {"reap_idle_tabs": True, "reap_interval_seconds": 600}})))
+        assert flag() is True
+
+
+class _RelaunchBackend:
+    """Server-test stand-in: driving calls launch, ``is_running`` does not.
+
+    Counts launches the way ``SeleniumChromeBackend._drv`` does, so the test
+    can see a resurrection without starting Chrome.
+    """
+
+    def __init__(self):
+        from browden.common.tab import TabInfo
+        self._tab = TabInfo
+        self.profile_dir = "/fake/profile"
+        self.calls: list = []
+        self.running = False
+        self.launches = 0
+        self.live: set[str] = set()
+        self.active = "h1"
+
+    def get_profile_dir(self):
+        return self.profile_dir
+
+    def shutdown(self):
+        self.calls.append("shutdown")
+
+    def _launch(self):
+        if not self.running:
+            self.launches += 1
+            self.running = True
+            if not self.live:
+                self.live.add("h1")
+
+    def is_running(self):
+        self.calls.append("is_running")
+        return self.running
+
+    def list_handles(self):
+        self.calls.append("list_handles")
+        self._launch()
+        return list(self.live)
+
+    def list_tabs(self):
+        self.calls.append("list_tabs")
+        self._launch()
+        return [self._tab(handle=h, url="about:blank", title="t", selected=True,
+                          profile_dir=self.profile_dir) for h in self.live]
+
+    def new_blank_tab(self):
+        self.calls.append("new_blank_tab")
+        self._launch()
+        handle = f"h{len(self.live) + 1}"
+        self.live.add(handle)
+        self.active = handle
+        return self._tab(handle=handle, url="about:blank", title="t", selected=True,
+                         profile_dir=self.profile_dir)
+
+    def select_tab(self, handle):
+        self.calls.append(("select_tab", handle))
+        self._launch()
+        self.active = handle
+
+    def navigate(self, url):
+        self.calls.append(("navigate", url))
+        self._launch()
+        return self._tab(handle=self.active, url=url, title="t", selected=True,
+                         profile_dir=self.profile_dir)
+
+
+@pytest.mark.asyncio
+async def test_disabled_sweep_does_not_start_reaper_and_list_does_not_relaunch(monkeypatch):
+    """The deployed wiring: config false, real session, no periodic task.
+
+    Explicit ``new_blank_tab`` and ``navigate`` still take the launch path.
+    ``list_tabs`` on a session whose Chrome has exited only probes
+    ``is_running``. Entering the reaper loop directly — the housekeeping
+    path — does not call ``list_handles``.
+    """
+    import browden.mcp.server as server
+    from browden.configs.loader import AllowlistRefresher
+    from browden.mcp.validator import ActionAllowlist
+    importlib.reload(server)
+
+    backend = _RelaunchBackend()
+    monkeypatch.setattr(server, "_refresher", AllowlistRefresher.static(
+        ActionAllowlist({"infra": {"reap_idle_tabs": False}})))
+    monkeypatch.setattr(server, "_backend_for", lambda _profile: backend)
+
+    opened = await server.new_blank_tab(profile_dir=None)
+    assert "error" not in opened
+    session = server._store.sessions()[0]
+    assert session._reaper_task is None
+    assert backend.launches >= 1
+    opened_launches = backend.launches
+    assert backend.calls.count("list_handles") == 1
+
+    backend.running = False  # user closed the window; the server stays up
+    listed = await server.list_tabs()
+    assert listed == []
+    assert backend.launches == opened_launches
+    assert "list_tabs" not in backend.calls
+    assert backend.calls.count("list_handles") == 1
+
+    await session.navigate("https://example.test/", id=opened["id"])
+    assert backend.launches > opened_launches
+
+    backend.running = False
+    launches_before_housekeeping = backend.launches
+    await session._reaper_loop()
+    assert session._reaper_task is None
+    assert backend.launches == launches_before_housekeeping
+    assert backend.calls.count("list_handles") == 1
+
+
+@pytest.mark.asyncio
+async def test_default_config_still_starts_the_idle_reaper(monkeypatch):
+    """Omitting the flag keeps today's behavior: the periodic task runs."""
+    import asyncio
+    import browden.mcp.server as server
+    importlib.reload(server)
+
+    backend = _RelaunchBackend()
+    monkeypatch.setattr(server, "_backend_for", lambda _profile: backend)
+    try:
+        await server.new_blank_tab(profile_dir=None)
+        session = server._store.sessions()[0]
+        task = session._reaper_task
+        assert task is not None
+        assert not task.done()
+    finally:
+        for session in server._store.sessions():
+            session.close()
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
 async def test_navigate_tool_validates_then_delegates():
     import browden.mcp.server as server
     importlib.reload(server)

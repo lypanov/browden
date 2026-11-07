@@ -15,6 +15,10 @@ DEFAULT_MAX_TABS_PER_SESSION = 20
 # How often the idle reaper wakes. Deliberately coarse: sweeping is the only
 # cleanup pass (tools never sweep), and a tab idle for an hour can wait.
 DEFAULT_REAP_INTERVAL_SECONDS = 7200
+# The periodic sweep is on unless the operator opts out. False means the
+# server must not start the reaper: its tick calls list_handles, and listing
+# a dead browser relaunches Chrome the user has closed.
+DEFAULT_REAP_IDLE_TABS = True
 
 # canonical_host is imported (not redefined) so the denylist/overrides normalize
 # hosts identically to the Tranco check — a trailing dot or leading www. must not
@@ -375,7 +379,8 @@ class ActionAllowlist:
               - path: ['^/gp/css/order-history.*']
                 label: '(?i)grocery tip.*'
                 field_ids: [tip-widget--edit-form--amount-input]
-    * ``infra`` — session/tab caps.
+    * ``infra`` — session/tab caps, the idle-sweep interval, and
+      ``reap_idle_tabs`` (default true; false disables the periodic sweep).
 
     ``read_policy`` gates reads; ``denylist`` is the always-deny list (also
     consulted by write actions); ``section(name)`` and ``rules_for(name, ...)``
@@ -392,6 +397,7 @@ class ActionAllowlist:
         self.max_browser_sessions = DEFAULT_MAX_BROWSER_SESSIONS
         self.max_tabs_per_session = DEFAULT_MAX_TABS_PER_SESSION
         self.reap_interval_seconds = DEFAULT_REAP_INTERVAL_SECONDS
+        self.reap_idle_tabs = DEFAULT_REAP_IDLE_TABS
         # A denylist blocks broadly: prefix match, not fullmatch (see Allowlist).
         self._denylist = Allowlist.create_denylist(
             _coerce_section(sections.get("denylist"), want_label=False, where="denylist"))
@@ -406,6 +412,15 @@ class ActionAllowlist:
                         rules.get("max_tabs_per_session", DEFAULT_MAX_TABS_PER_SESSION))
                     self.reap_interval_seconds = int(
                         rules.get("reap_interval_seconds", DEFAULT_REAP_INTERVAL_SECONDS))
+                    if "reap_idle_tabs" in rules:
+                        flag = rules["reap_idle_tabs"]
+                        # Schema rejects non-bools on the file path. A direct
+                        # dict (tests) must not coerce: bool("false") is True.
+                        if not isinstance(flag, bool):
+                            raise ValueError(
+                                "infra.reap_idle_tabs must be a boolean, "
+                                f"got {type(flag).__name__}")
+                        self.reap_idle_tabs = flag
                 continue
             host_rules = _coerce_section(rules, want_label=True, where=action)
             self._rules[action] = {canonical_host(h): rs for h, rs in host_rules.items()}

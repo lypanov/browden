@@ -4,6 +4,7 @@ from browden.mcp.validator import ActionAllowlist
 from browden.mcp.validator.allowlist import (
     DEFAULT_MAX_BROWSER_SESSIONS,
     DEFAULT_MAX_TABS_PER_SESSION,
+    DEFAULT_REAP_IDLE_TABS,
     DEFAULT_REAP_INTERVAL_SECONDS,
 )
 
@@ -400,6 +401,7 @@ def test_infra_defaults_when_the_section_is_absent():
     assert al.max_browser_sessions == DEFAULT_MAX_BROWSER_SESSIONS
     assert al.max_tabs_per_session == DEFAULT_MAX_TABS_PER_SESSION
     assert al.reap_interval_seconds == DEFAULT_REAP_INTERVAL_SECONDS == 7200
+    assert al.reap_idle_tabs is DEFAULT_REAP_IDLE_TABS is True
 
 
 def test_infra_reap_interval_is_read_from_the_config():
@@ -407,6 +409,19 @@ def test_infra_reap_interval_is_read_from_the_config():
     assert al.reap_interval_seconds == 600
     # An unset sibling keeps its default rather than following the one that was set.
     assert al.max_tabs_per_session == DEFAULT_MAX_TABS_PER_SESSION
+    assert al.reap_idle_tabs is True
+
+
+def test_infra_reap_idle_tabs_can_be_turned_off_without_changing_the_interval():
+    al = ActionAllowlist({"infra": {"reap_idle_tabs": False}})
+    assert al.reap_idle_tabs is False
+    assert al.reap_interval_seconds == DEFAULT_REAP_INTERVAL_SECONDS
+
+
+def test_infra_reap_idle_tabs_rejects_a_non_boolean():
+    # bool("false") is True, so a string must not be coerced into the flag.
+    with pytest.raises(ValueError, match="must be a boolean"):
+        ActionAllowlist({"infra": {"reap_idle_tabs": "false"}})
 
 
 # The shipped sample (configs/samples/read_only_on_popular_websites.yaml) is

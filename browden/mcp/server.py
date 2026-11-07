@@ -211,9 +211,13 @@ async def new_blank_tab(profile_dir: str | None = None) -> dict:
         session = _store.get_or_create_session(
             _backend_for(profile_dir),
             max_sessions=_refresher.allowlist.max_browser_sessions,
-            # A getter, not a value: the session's reaper re-reads it every tick,
-            # so an infra.reap_interval_seconds edit lands without a restart.
-            reap_interval_seconds=lambda: _refresher.allowlist.reap_interval_seconds)
+            # Getters, not values: the session's reaper re-reads them every tick,
+            # so an infra edit lands without a restart. reap_idle_tabs false
+            # means the periodic task is not started — its tick would call
+            # list_handles and relaunch a Chrome the user has closed. The
+            # at-cap reclaim inside new_blank_tab is separate and still runs.
+            reap_interval_seconds=lambda: _refresher.allowlist.reap_interval_seconds,
+            reap_idle_tabs=lambda: _refresher.allowlist.reap_idle_tabs)
         result = await session.new_blank_tab(max_tabs=_refresher.allowlist.max_tabs_per_session)  # wire dict with composite id
     except RuntimeError as e:
         return {"error": str(e)}
@@ -610,6 +614,13 @@ def main(argv: list[str] | None = None) -> None:
     except ConfigError as e:
         parser.error(str(e))
     logger.info(f"Loaded allowlist config from {path}")
+    if not _refresher.allowlist.reap_idle_tabs:
+        # Logged at boot, before any session exists, so an operator can confirm
+        # the opt-out from the service log without first opening a tab. The
+        # session logs it again when it declines to start the task.
+        logger.info(
+            "Periodic idle-tab sweep disabled (infra.reap_idle_tabs is false); "
+            "Chrome starts only on an explicit browser request")
 
     transport = os.environ.get("MCP_TRANSPORT", "stdio")
     logger.info(f"MCP Server starting (transport={transport})")

@@ -8,6 +8,16 @@ All notable changes to browden are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Opt out of the periodic idle-tab sweep with `infra.reap_idle_tabs: false`.**
+  The default stays `true` (sweep every `reap_interval_seconds`, 2h). The
+  reaper's tick calls `list_handles`, and listing a dead browser relaunches
+  Chrome, so a long-lived server brings a closed window back with no tool
+  request. When the flag is false the periodic task is not started. Explicit
+  browser operations still start Chrome on demand, and `new_blank_tab` still
+  reclaims idle tabs at the per-session cap. A running reaper that sees the
+  flag go false exits without sweeping; turning the sweep back on takes a
+  process restart. `reap_interval_seconds: 0` remains invalid — zero is not
+  the off switch, because the reaper sleeps its interval.
 - **`invalidate_dom_cache` tool.** Drops a tab's cached DOM snapshot so the next
   read re-fetches the live HTML, without reloading the page — the fix for a
   change the *page itself* made after the snapshot was taken (its own JS
