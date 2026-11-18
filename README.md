@@ -145,7 +145,15 @@ cookies, storage, and logins. The crucial rule:
 > by only a single Chrome process (it's guarded by Chrome's `SingletonLock`).
 
 browden keeps **one browser session per profile**, launched lazily on
-first use. That has two consequences:
+first use. If Chrome is slow to start (for example the first launch after it
+auto-updated) or a process already holds the profile, browden **reports an
+error naming that PID** rather than killing the process, clearing
+`SingletonLock` / `SingletonSocket`, or launching a second Chrome on top —
+any of those can wipe the profile's cookies. Wait, or quit that PID yourself
+if it is stuck; do not retry the launch. A Chrome that has actually exited
+is still started on the next driving call.
+
+One session per profile has two consequences:
 
 - **Different profiles run in parallel.** Give a request its own `profile_dir`
   and it gets an independent Chrome process — so separate profiles can be driven

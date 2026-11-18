@@ -27,6 +27,23 @@ All notable changes to browden are documented here. The format follows
   the tab's live URL at read time. A tab that is gone returns the usual tab-gone
   envelope (#137).
 
+### Changed
+- **DevTools startup wait is 5 minutes** (was 60 seconds), so a slow first
+  launch after a Chrome update can finish instead of being declared dead.
+
+### Fixed
+- **Do not kill a starting Chrome, clear its `Singleton*` files, or launch a
+  second copy on the same profile.** A slow first start (seen after a Chrome
+  auto-update: DevTools not up in 60s) used to SIGTERM/SIGKILL that process
+  and, on the next tool call, unlink `SingletonSocket` and spawn another
+  Chrome on the same `--user-data-dir`. Chromium's ProcessSingleton treats a
+  missing socket as a hung peer and SIGKILLs it; the cookie SQLite DB then
+  comes back empty while History and Login Data survive. Browden now refuses
+  those retries: it reports an error naming the PID that holds the profile
+  (or that is still starting) and leaves the browser alone. A genuinely dead
+  Chrome (process exited, stale lock) can still be started on the next
+  driving call. The idle-reaper opt-out is unchanged.
+
 ## [1.2.1] — 2026-07-29
 
 ### Fixed
