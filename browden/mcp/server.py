@@ -18,7 +18,7 @@ from ..configs.loader import (
     resolve_allowlist_path,
 )
 from ..dependencies.mcp import FastMCP, Image
-from ..web_navigator.selenium_chrome import SeleniumChromeBackend
+from ..web_navigator.selenium_chrome import ChromeLaunchError, SeleniumChromeBackend
 from .session_management.browser_session_store import BrowserSessionStore, UnknownTabError
 
 from .validator import (
@@ -122,12 +122,16 @@ def _backend_for(profile_dir: str | None) -> SeleniumChromeBackend:
 
 
 def _tool(fn: Callable[..., Awaitable[dict]]) -> Callable[..., Awaitable[dict]]:
-    """Turn UnknownTabError / SessionBusyError into the error envelopes tools return.
+    """Turn UnknownTabError / SessionBusyError / ChromeLaunchError into error envelopes.
 
     ``SessionBusyError`` means this request waited out the driver-lock timeout
     behind other requests on the same profile (see ``BrowserSessionManager``);
     the tab it names is fine, so the envelope echoes the ``id`` back the way the
     tab-gone one does, and the agent can simply retry.
+
+    ``ChromeLaunchError`` means Chrome is starting, stuck, or already holding
+    this profile — browden will not kill it or launch a second copy (that can
+    wipe cookies). The agent should report the error, not retry the launch.
     """
     @functools.wraps(fn)
     async def wrapper(*args, **kwargs) -> dict:
@@ -138,6 +142,9 @@ def _tool(fn: Callable[..., Awaitable[dict]]) -> Callable[..., Awaitable[dict]]:
         except SessionBusyError as e:
             # FastMCP calls tools with keyword arguments, so the tab's id (if the
             # tool takes one) is in kwargs.
+            id = kwargs.get("id")
+            return e.envelope if id is None else {**e.envelope, "id": id}
+        except ChromeLaunchError as e:
             id = kwargs.get("id")
             return e.envelope if id is None else {**e.envelope, "id": id}
     return wrapper
@@ -205,6 +212,11 @@ async def new_blank_tab(profile_dir: str | None = None) -> dict:
     to a profile's tabs are safe but are served one after another (each
     re-selects its own tab), so they do not run in parallel. Use separate
     profile_dirs for genuine parallelism.
+
+    If Chrome is slow to start or already holds this profile, this returns an
+    error naming the PID rather than killing that process or launching a
+    second Chrome on top of it (either of those can wipe cookies). Do not retry
+    the launch; wait, or quit that PID yourself if it is stuck.
     """
     logger.info(f"Tool called: new_blank_tab (profile_dir={profile_dir!r})")
     try:

@@ -79,10 +79,41 @@ def _no_sandbox_enabled() -> bool:
 
 SINGLETON_FILES = ("SingletonLock", "SingletonCookie", "SingletonSocket")
 TITLE_WAIT_SECONDS = 3
-# Cold Chrome starts can take several seconds; under concurrent launches (many
-# profiles at once) plus a loaded host, give the DevTools endpoint generous
-# margin before declaring the launch failed.
-DEVTOOLS_WAIT_SECONDS = 60
+# Cold Chrome starts can take several seconds; a first launch after a Chrome
+# update can take much longer (profile/cookie-DB migration, macOS Keychain
+# "Chrome Safe Storage" prompt). Give the DevTools endpoint minutes, not
+# seconds — timing out and killing Chrome mid-startup can wipe the cookie
+# store. See ChromeLaunchError.
+DEVTOOLS_WAIT_SECONDS = 300
+
+
+class ChromeLaunchError(RuntimeError):
+    """Chrome could not be started or attached without risking the profile.
+
+    Raised instead of killing a Chrome that is still starting, clearing
+    ``Singleton*`` files a live process may hold, or launching a second Chrome
+    on the same ``--user-data-dir``. Those retries are what wipe cookies (the
+    profile's SQLite cookie DB is not safe for two processes, and Chromium's
+    ProcessSingleton will SIGKILL a peer it cannot talk to on the singleton
+    socket). A ``RuntimeError`` subclass so MCP tools that already fold
+    session-level RuntimeErrors into an error envelope keep doing so.
+
+    ``proc`` is set when *we* spawned that Chrome (so the backend can remember
+    it and refuse a second spawn). ``pid`` is the process that holds the
+    profile, whether we spawned it or not.
+    """
+
+    def __init__(self, message: str, *, proc: subprocess.Popen | None = None,
+                 pid: int | None = None):
+        super().__init__(message)
+        self.proc = proc
+        self.pid = pid if pid is not None else (proc.pid if proc is not None else None)
+
+    @property
+    def envelope(self) -> dict:
+        return {"error": str(self)}
+
+
 CHROME_BINARY_NAMES = (
     "google-chrome",
     "google-chrome-stable",
@@ -215,7 +246,8 @@ def _wait_for_devtools(port: int, proc: subprocess.Popen, timeout: float = DEVTO
     """Block until Chrome's DevTools HTTP endpoint answers, or fail loudly.
 
     Bails early (rather than waiting out the timeout) if the Chrome process
-    exits before the port comes up.
+    exits before the port comes up. Does not kill Chrome — the caller decides,
+    and a timeout must *not* terminate a process that may still be starting.
     """
     url = f"http://127.0.0.1:{port}/json/version"
     deadline = time.monotonic() + timeout
@@ -231,11 +263,19 @@ def _wait_for_devtools(port: int, proc: subprocess.Popen, timeout: float = DEVTO
                     return
         except (urllib.error.URLError, OSError):
             time.sleep(0.1)
-    raise RuntimeError(f"Chrome DevTools endpoint not ready on port {port} after {timeout}s.")
+    raise RuntimeError(
+        f"Chrome DevTools endpoint not ready on port {port} after {timeout}s "
+        f"(PID {proc.pid} is still running)."
+    )
 
 
 def _terminate(proc: subprocess.Popen | None) -> None:
-    """Stop a Chrome subprocess, escalating to kill if it lingers."""
+    """Stop a Chrome subprocess, escalating to kill if it lingers.
+
+    Only for an explicit shutdown of a Chrome we launched and already attached
+    to — never for a startup timeout. SIGTERM lets Chrome flush the cookie DB;
+    SIGKILL is the last resort after that flush has had time to land.
+    """
     if proc is None or proc.poll() is not None:
         return
     try:
@@ -248,20 +288,148 @@ def _terminate(proc: subprocess.Popen | None) -> None:
         logger.warning(f"Failed to terminate Chrome process: {e}")
 
 
+def _pid_is_alive(pid: int) -> bool:
+    """True if ``pid`` currently names a process.
+
+    ``os.kill(pid, 0)`` is the POSIX existence probe: ESRCH means gone,
+    EPERM means it exists but we can't signal it (still live). Any other
+    error is treated as live — a false "dead" here is how a second Chrome
+    gets launched on a profile that is still held.
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _pid_from_singleton_lock_target(target: str) -> int | None:
+    """Parse the PID out of Chromium's ``<hostname>-<pid>`` symlink target.
+
+    Hostname may itself contain hyphens, so this splits on the last ``-``,
+    matching ``ParseProcessSingletonLock`` in
+    ``chrome/common/process_singleton_lock_posix.cc``.
+    """
+    _, sep, pid_str = target.rpartition("-")
+    if not sep or not pid_str.isdigit():
+        return None
+    pid = int(pid_str)
+    return pid if pid > 0 else None
+
+
+def _singleton_lock_pid(profile_dir: Path) -> int | None:
+    """PID encoded in Chrome's POSIX ``SingletonLock`` symlink, if any.
+
+    The lock is a symlink whose *target is not a real path* (e.g.
+    ``example.com-9156``), so ``Path.exists()`` follows it and returns False
+    even while the lock is present. Always ``lstat`` / ``readlink``.
+    Non-symlink lock files (Windows, or a leftover regular file) have no PID
+    we can parse and return None.
+    """
+    lock = profile_dir / "SingletonLock"
+    try:
+        if not lock.is_symlink():
+            return None
+        return _pid_from_singleton_lock_target(os.readlink(lock))
+    except OSError:
+        return None
+
+
+def _unparseable_posix_lock(profile_dir: Path) -> bool:
+    """True when a POSIX SingletonLock symlink exists but names no PID.
+
+    We cannot prove that lock is stale, so callers must not clear it or
+    launch another Chrome on top.
+    """
+    lock = profile_dir / "SingletonLock"
+    try:
+        if not lock.is_symlink():
+            return False
+        return _pid_from_singleton_lock_target(os.readlink(lock)) is None
+    except OSError:
+        return False
+
+
+def _profile_holder_pid(profile_dir: Path) -> int | None:
+    """Live PID that holds this profile, or None if the lock looks free.
+
+    "Free" means there is no POSIX lock, or it names a PID that has exited.
+    An unparseable symlink is *not* free — see ``_unparseable_posix_lock``.
+    """
+    pid = _singleton_lock_pid(profile_dir)
+    if pid is not None and _pid_is_alive(pid):
+        return pid
+    return None
+
+
+def _refuse_held_profile(profile_dir: Path) -> None:
+    """Raise ``ChromeLaunchError`` if a live (or unproven-dead) lock holds the profile."""
+    holder = _profile_holder_pid(profile_dir)
+    if holder is not None:
+        raise ChromeLaunchError(
+            f"Chrome PID {holder} already holds this profile; not launching a "
+            f"second instance (that can wipe cookies). Leave that process "
+            f"alone, or quit PID {holder} yourself if it is stuck.",
+            pid=holder,
+        )
+    if _unparseable_posix_lock(profile_dir):
+        lock = profile_dir / "SingletonLock"
+        raise ChromeLaunchError(
+            f"A SingletonLock exists at {lock} but its PID could not be "
+            f"verified as dead; not clearing it or launching another Chrome "
+            f"on this profile.",
+            pid=None,
+        )
+
+
+def _lexists(path: Path) -> bool:
+    """True if ``path`` exists *or* is a dangling symlink (``exists()`` is False)."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    return True
+
+
 def _launch_chrome(profile_dir: Path) -> tuple[subprocess.Popen, int]:
     """Launch Chrome directly (no chromedriver) with remote debugging on.
 
     Returns the running process and the DevTools port to attach Selenium to.
+    Refuses if this profile is already held. On a DevTools timeout, leaves
+    the new Chrome running and raises ``ChromeLaunchError`` carrying that
+    process — the caller must remember it so a later call does not spawn
+    another Chrome on top of it.
     """
+    _refuse_held_profile(profile_dir)
     _clear_stale_singletons(profile_dir)
     port = _free_port()
     args = _chrome_args(profile_dir, port)
     logger.info(f"Launching Chrome directly: {' '.join(args)}")
-    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # New session so a signal aimed at the MCP server does not also kill
+    # Chrome (a SIGHUP mid-write is another way to lose the cookie DB).
+    proc = subprocess.Popen(
+        args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
     try:
         _wait_for_devtools(port, proc)
-    except Exception:
-        _terminate(proc)
+    except Exception as e:
+        if proc.poll() is None:
+            raise ChromeLaunchError(
+                f"Chrome DevTools endpoint not ready on port {port} after "
+                f"{DEVTOOLS_WAIT_SECONDS:g}s (PID {proc.pid} is still running). "
+                f"Not killing it and not launching another Chrome on this "
+                f"profile — a mid-startup kill can destroy cookies. Wait for "
+                f"that process to finish, or quit PID {proc.pid} yourself if "
+                f"it is stuck.",
+                proc=proc,
+            ) from e
         raise
     return proc, port
 
@@ -282,14 +450,23 @@ def _wait_for_title(drv, timeout: float = TITLE_WAIT_SECONDS) -> None:
 def _clear_stale_singletons(profile_dir: Path) -> None:
     """Remove Singleton* files left over from an unclean shutdown.
 
-    Chrome creates these symlinks when it starts and removes them on clean
-    exit. After a power-off, kill -9, or container restart they point at
-    dead PIDs and block the next launch.
+    Chrome creates these when it starts and removes them on clean exit.
+    After a power-off, kill -9, or container restart they point at dead
+    PIDs and block the next launch.
+
+    Must not run while a live process may hold the profile: unlinking
+    ``SingletonSocket`` while Chrome is still starting is exactly how a
+    second Chrome decides the first is hung and SIGKILLs it (see
+    ``chrome/browser/process_singleton_posix.cc``). ``Path.exists()`` also
+    cannot see the POSIX ``SingletonLock`` symlink (its target is not a
+    real path), so this uses ``lstat`` and refuses rather than clearing
+    when the lock names a live PID.
     """
+    _refuse_held_profile(profile_dir)
     for name in SINGLETON_FILES:
         path = profile_dir / name
         try:
-            if path.exists():
+            if _lexists(path):
                 logger.info(f"Clearing stale singleton: {path}")
                 path.unlink(missing_ok=True)
         except OSError as e:
@@ -327,19 +504,18 @@ class SeleniumChromeBackend(WebNavigatorBackend):
     def shutdown(self) -> None:
         """Public teardown for orderly shutdown (see ``WebNavigatorBackend.shutdown``).
 
-        Delegates to the same ``_teardown`` used internally to heal a dead
-        session, so a stopped backend leaves no orphaned Chrome or stale
-        SingletonLock behind.
+        This is the only path that stops a Chrome we launched. A failed
+        liveness probe or a slow start must not reach here — killing Chrome
+        mid-startup is how the cookie store gets destroyed.
         """
         self._teardown()
 
-    def _teardown(self) -> None:
-        """Drop the WebDriver session and stop the Chrome we launched.
+    def _detach_driver(self) -> None:
+        """Drop the WebDriver attachment without touching the Chrome process.
 
-        Selenium only *attached* to Chrome over the DevTools port, so
-        ``driver.quit()`` detaches without closing the browser — we own the
-        process and must terminate it ourselves, or it (and its SingletonLock)
-        outlives the dead session and blocks the next launch.
+        Selenium only *attached* over the DevTools port, so ``driver.quit()``
+        detaches without closing the browser. A failed probe is not proof the
+        browser (and its profile) is safe to kill.
         """
         if self._driver is not None:
             try:
@@ -347,29 +523,44 @@ class SeleniumChromeBackend(WebNavigatorBackend):
             except Exception:
                 pass
             self._driver = None
+
+    def _teardown(self) -> None:
+        """Drop the WebDriver session and stop the Chrome we launched.
+
+        Reserved for explicit ``shutdown``. Selenium only *attached* to Chrome
+        over the DevTools port, so ``driver.quit()`` detaches without closing
+        the browser — we own the process and must terminate it ourselves on
+        the way out, or it (and its SingletonLock) outlives the MCP server.
+        """
+        self._detach_driver()
         _terminate(self._chrome_proc)
         self._chrome_proc = None
 
     def _session_alive(self, check_current: bool) -> bool:
-        """Whether the attached driver is live; tears it down (no relaunch) on failure.
+        """Whether the attached driver is live; detaches (does not kill Chrome) on failure.
 
         The single liveness probe both ``is_running`` and ``_drv`` share. Always
         checks ``window_handles`` (the session is up); with ``check_current`` also
         checks ``current_window_handle`` (the focused-window context later commands
-        need — a "no such window" here is what would otherwise blow up mid-op).
-        A failing probe tears the dead session down and returns False, so callers
-        decide what next without a browser being spawned here: ``is_running``
-        reports it, ``_drv`` relaunches.
+        need). A "no such window" here is recovered by focusing a remaining
+        handle rather than treating the whole browser as dead. Any other failed
+        probe drops the driver attachment only — never the Chrome process — and
+        returns False, so callers decide what next: ``is_running`` reports it,
+        ``_drv`` launches only if nothing still holds the profile.
         """
         if self._driver is None:
             return False
         try:
-            _ = self._driver.window_handles
+            handles = self._driver.window_handles
             if check_current:
-                _ = self._driver.current_window_handle
+                try:
+                    _ = self._driver.current_window_handle
+                except NoSuchWindowException:
+                    if handles:
+                        self._driver.switch_to.window(handles[0])
             return True
         except Exception:
-            self._teardown()
+            self._detach_driver()
             return False
 
     def is_running(self) -> bool:
@@ -379,25 +570,55 @@ class SeleniumChromeBackend(WebNavigatorBackend):
         only want to look (list_tabs across profiles) must not spawn a browser
         as a side effect. Only the session-level probe — a valid *current window*
         is ``_drv``'s concern (it can heal one), not this look-only check.
+        A failed probe never kills Chrome.
         """
         return self._session_alive(False)
 
+    def _chrome_proc_running(self) -> bool:
+        return self._chrome_proc is not None and self._chrome_proc.poll() is None
+
     def _drv(self):
-        # Health-check the attached driver (session AND current-window context);
-        # a failed probe has already torn it down, so (re)launch a fresh one.
-        if not self._session_alive(True):
-            profile = self._profile_dir
-            logger.info(f"Starting new Chrome session (profile={profile})")
+        # Health-check the attached driver (session AND current-window context).
+        # A failed probe has already detached the driver, not killed Chrome.
+        if self._session_alive(True):
+            return self._driver
+        # A Chrome we launched (or one whose SingletonLock is still live) must
+        # not be stacked with a second instance — that is the cookie-wipe path.
+        if self._chrome_proc_running():
+            raise ChromeLaunchError(
+                f"Chrome PID {self._chrome_proc.pid} is still running on this "
+                f"profile but is not responding over DevTools. Not launching "
+                f"another Chrome (that can wipe cookies). Wait, or quit PID "
+                f"{self._chrome_proc.pid} yourself if it is stuck.",
+                proc=self._chrome_proc,
+            )
+        _refuse_held_profile(self._profile_dir)
+        profile = self._profile_dir
+        logger.info(f"Starting new Chrome session (profile={profile})")
+        try:
             self._chrome_proc, port = _launch_chrome(profile)
-            # Attach to the Chrome we just launched instead of letting
-            # chromedriver spawn its own (automation-flagged) instance.
-            opts = ChromeOptions()
-            opts.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
-            try:
-                self._driver = webdriver.Chrome(options=opts)
-            except Exception:
-                self._teardown()
-                raise
+        except ChromeLaunchError as e:
+            # Remember a Chrome we spawned but could not attach to, so the
+            # next call sees it via _chrome_proc_running and does not spawn
+            # another.
+            if e.proc is not None:
+                self._chrome_proc = e.proc
+            raise
+        # Attach to the Chrome we just launched instead of letting
+        # chromedriver spawn its own (automation-flagged) instance.
+        opts = ChromeOptions()
+        opts.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
+        try:
+            self._driver = webdriver.Chrome(options=opts)
+        except Exception as e:
+            self._detach_driver()
+            pid = self._chrome_proc.pid if self._chrome_proc is not None else None
+            raise ChromeLaunchError(
+                f"Chrome PID {pid} is running but Selenium could not attach "
+                f"to DevTools on port {port}. Not killing it and not launching "
+                f"another Chrome on this profile.",
+                proc=self._chrome_proc,
+            ) from e
         return self._driver
 
     def _tabinfo(self, drv, *, selected: bool) -> TabInfo:
@@ -463,9 +684,9 @@ class SeleniumChromeBackend(WebNavigatorBackend):
         drv.close()
         # drv.close() leaves the driver focused on the now-dead handle. The next
         # command — or _drv()'s health check, which reads current_window_handle —
-        # would then mistake the session for dead and relaunch the whole browser,
-        # taking every other tab with it. Re-focus a survivor to keep the session
-        # valid.
+        # would then mistake the focused window for gone. Re-focus a survivor so
+        # the session stays valid (and so we never treat a missing window as
+        # "launch another Chrome").
         remaining = drv.window_handles
         if remaining:
             drv.switch_to.window(remaining[0])

@@ -1,3 +1,4 @@
+import os
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
@@ -6,15 +7,29 @@ from browden.dependencies.selenium import NoSuchWindowException
 from browden.web_navigator.interface import TabNotFoundError
 import browden.web_navigator.selenium_chrome.backend as backend
 from browden.web_navigator.selenium_chrome.backend import (
+    DEVTOOLS_WAIT_SECONDS,
     SINGLETON_FILES,
+    ChromeLaunchError,
     SeleniumChromeBackend,
     _chrome_args,
     _clear_stale_singletons,
     _find_chrome_binary,
     _launch_chrome,
+    _lexists,
+    _pid_from_singleton_lock_target,
+    _pid_is_alive,
+    _profile_holder_pid,
+    _singleton_lock_pid,
     _wellknown_chrome_paths,
 )
 
+
+# POSIX SingletonLock is a symlink to a non-existent ``host-pid`` path. Unit
+# tests that plant one skip on Windows, where that lock is a regular file and
+# creating symlinks often needs a privilege the CI runner does not have.
+_posix_lock = pytest.mark.skipif(
+    os.name == "nt", reason="POSIX SingletonLock is a symlink"
+)
 
 # The backend deals in raw Selenium handles — no namespace. profile_dir is
 # required, defaulted here so tests that don't care can omit it.
@@ -93,16 +108,48 @@ def test_drv_recreates_after_dead_session(mock_webdriver, mock_launch):
     backend = _backend()
     backend._driver = dead  # simulate a cached, dead driver
     dead_proc = MagicMock(name="dead_chrome")
-    dead_proc.poll.return_value = None  # still "running" so _terminate acts
+    dead_proc.poll.return_value = 1  # process actually exited — safe to relaunch
     backend._chrome_proc = dead_proc
 
     drv = backend._drv()
 
     assert drv is alive
     dead.quit.assert_called_once()
-    dead_proc.terminate.assert_called_once()  # the old Chrome is reaped
+    dead_proc.terminate.assert_not_called()  # never kill; it already exited
     assert mock_webdriver.Chrome.call_count == 1  # one new driver after the dead one
     assert mock_launch.call_count == 1
+
+
+@patch("browden.web_navigator.selenium_chrome.backend._launch_chrome")
+@patch("browden.web_navigator.selenium_chrome.backend.webdriver")
+def test_drv_does_not_relaunch_or_kill_when_chrome_is_still_running(mock_webdriver, mock_launch):
+    """A wedged driver with a live Chrome must not spawn a second instance.
+
+    That is the cookie-wipe path: SIGTERM/SIGKILL the starter, clear
+    SingletonSocket, launch again on the same profile.
+    """
+    dead = _make_fake_driver(dead=True)
+    backend = _backend()
+    backend._driver = dead
+    live_proc = MagicMock(name="live_chrome")
+    live_proc.poll.return_value = None
+    live_proc.pid = 4242
+    backend._chrome_proc = live_proc
+
+    with pytest.raises(ChromeLaunchError, match="PID 4242") as exc:
+        backend._drv()
+
+    assert "Not launching another Chrome" in str(exc.value)
+    live_proc.terminate.assert_not_called()
+    live_proc.kill.assert_not_called()
+    mock_launch.assert_not_called()
+    mock_webdriver.Chrome.assert_not_called()
+    dead.quit.assert_called_once()  # detached the dead driver only
+    assert backend._chrome_proc is live_proc  # still tracked
+
+
+def test_devtools_wait_is_five_minutes():
+    assert DEVTOOLS_WAIT_SECONDS == 300
 
 
 def test_clear_stale_singletons_removes_files(tmp_path):
@@ -119,6 +166,85 @@ def test_clear_stale_singletons_removes_files(tmp_path):
 
 def test_clear_stale_singletons_noop_when_absent(tmp_path):
     _clear_stale_singletons(tmp_path)  # must not raise on empty dir
+
+
+@_posix_lock
+def test_clear_stale_singletons_removes_dangling_lock_for_dead_pid(tmp_path):
+    """POSIX SingletonLock is a symlink to a non-existent ``host-pid`` path.
+
+    ``Path.exists()`` follows it and returns False, which is how the old
+    clearer left the lock in place while still unlinking SingletonSocket —
+    the exact sequence that lets a second Chrome SIGKILL the first.
+    A lock that names a dead PID is safe to remove.
+    """
+    lock = tmp_path / "SingletonLock"
+    sock = tmp_path / "SingletonSocket"
+    lock.symlink_to("testhost-999999")
+    sock.symlink_to("/tmp/does-not-exist-browden-socket")
+    assert not lock.exists()  # dangling: exists() is the trap
+    assert lock.is_symlink()
+    assert not _pid_is_alive(999999)
+
+    _clear_stale_singletons(tmp_path)
+
+    assert not _lexists(lock)
+    assert not _lexists(sock)
+
+
+@_posix_lock
+def test_clear_stale_singletons_refuses_when_lock_pid_is_alive(tmp_path):
+    lock = tmp_path / "SingletonLock"
+    sock = tmp_path / "SingletonSocket"
+    lock.symlink_to(f"testhost-{os.getpid()}")
+    sock.write_text("socket")
+
+    with pytest.raises(ChromeLaunchError, match=f"PID {os.getpid()}") as exc:
+        _clear_stale_singletons(tmp_path)
+
+    assert "already holds this profile" in str(exc.value)
+    assert lock.is_symlink()  # untouched
+    assert sock.exists()  # SingletonSocket must not be unlinked either
+
+
+@_posix_lock
+def test_clear_stale_singletons_refuses_unparseable_posix_lock(tmp_path):
+    lock = tmp_path / "SingletonLock"
+    lock.symlink_to("no-pid-here")  # no trailing -<digits>
+    with pytest.raises(ChromeLaunchError, match="could not be verified"):
+        _clear_stale_singletons(tmp_path)
+    assert lock.is_symlink()
+
+
+def test_pid_from_singleton_lock_target_splits_on_last_hyphen():
+    assert _pid_from_singleton_lock_target("example.com-9156") == 9156
+    assert _pid_from_singleton_lock_target("my-host-name-42") == 42
+    assert _pid_from_singleton_lock_target("no-pid") is None
+    assert _pid_from_singleton_lock_target("host-0") is None
+    assert _pid_from_singleton_lock_target("") is None
+
+
+@_posix_lock
+def test_singleton_lock_pid_and_holder(tmp_path):
+    assert _singleton_lock_pid(tmp_path) is None
+    assert _profile_holder_pid(tmp_path) is None
+    lock = tmp_path / "SingletonLock"
+    lock.symlink_to(f"testhost-{os.getpid()}")
+    assert _singleton_lock_pid(tmp_path) == os.getpid()
+    assert _profile_holder_pid(tmp_path) == os.getpid()
+    lock.unlink()
+    lock.symlink_to("testhost-999999")
+    assert _singleton_lock_pid(tmp_path) == 999999
+    assert _profile_holder_pid(tmp_path) is None  # dead PID is not a holder
+    lock.unlink()
+    lock.write_text("not-a-symlink")
+    assert _singleton_lock_pid(tmp_path) is None  # Windows-style regular file
+
+
+def test_singleton_lock_pid_ignores_regular_file(tmp_path):
+    """Windows (and leftover regular files) have no PID we can parse."""
+    (tmp_path / "SingletonLock").write_text("not-a-symlink")
+    assert _singleton_lock_pid(tmp_path) is None
+    assert _profile_holder_pid(tmp_path) is None
 
 
 def test_chrome_args_have_no_automation_flags(tmp_path, monkeypatch):
@@ -250,6 +376,8 @@ def test_launch_chrome_clears_singletons_before_spawning(
     call_names = [c[0] for c in manager.mock_calls]
     assert call_names == ["clear", "Popen"]  # stale lock cleared before spawn
     mock_wait.assert_called_once()
+    # Detached from the MCP process group so a server SIGHUP cannot kill Chrome.
+    assert mock_subprocess.Popen.call_args.kwargs["start_new_session"] is True
 
 
 @patch("browden.web_navigator.selenium_chrome.backend._wait_for_devtools")
@@ -258,16 +386,54 @@ def test_launch_chrome_clears_singletons_before_spawning(
 @patch("browden.web_navigator.selenium_chrome.backend._free_port", return_value=4321)
 @patch("browden.web_navigator.selenium_chrome.backend._chrome_args", return_value=["chrome"])
 @patch("browden.web_navigator.selenium_chrome.backend._clear_stale_singletons")
-def test_launch_chrome_terminates_when_devtools_never_comes_up(
+def test_launch_chrome_does_not_kill_when_devtools_never_comes_up(
     mock_clear, mock_args, mock_port, mock_subprocess, mock_terminate, mock_wait, tmp_path
 ):
     proc = MagicMock(name="proc")
+    proc.poll.return_value = None  # still starting
+    proc.pid = 7777
     mock_subprocess.Popen.return_value = proc
     mock_wait.side_effect = RuntimeError("never came up")
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ChromeLaunchError, match="PID 7777") as exc:
         _launch_chrome(tmp_path)
-    mock_terminate.assert_called_once_with(proc)  # no orphaned Chrome
+    assert "Not killing it" in str(exc.value)
+    assert exc.value.proc is proc
+    mock_terminate.assert_not_called()  # leave the starter alone
+
+
+@patch("browden.web_navigator.selenium_chrome.backend._wait_for_devtools")
+@patch("browden.web_navigator.selenium_chrome.backend._terminate")
+@patch("browden.web_navigator.selenium_chrome.backend.subprocess")
+@patch("browden.web_navigator.selenium_chrome.backend._free_port", return_value=4321)
+@patch("browden.web_navigator.selenium_chrome.backend._chrome_args", return_value=["chrome"])
+@patch("browden.web_navigator.selenium_chrome.backend._clear_stale_singletons")
+def test_launch_chrome_does_not_kill_when_chrome_exits_before_devtools(
+    mock_clear, mock_args, mock_port, mock_subprocess, mock_terminate, mock_wait, tmp_path
+):
+    proc = MagicMock(name="proc")
+    proc.poll.return_value = 1
+    mock_subprocess.Popen.return_value = proc
+    mock_wait.side_effect = RuntimeError("Chrome exited (code 1)")
+
+    with pytest.raises(RuntimeError, match="Chrome exited") as exc:
+        _launch_chrome(tmp_path)
+    assert type(exc.value) is RuntimeError  # already dead: not a "leave it running" error
+    mock_terminate.assert_not_called()
+
+
+@patch("browden.web_navigator.selenium_chrome.backend.subprocess")
+@patch("browden.web_navigator.selenium_chrome.backend._free_port")
+@patch("browden.web_navigator.selenium_chrome.backend._chrome_args")
+@_posix_lock
+def test_launch_chrome_refuses_when_profile_is_held(
+    mock_args, mock_port, mock_subprocess, tmp_path
+):
+    (tmp_path / "SingletonLock").symlink_to(f"testhost-{os.getpid()}")
+    with pytest.raises(ChromeLaunchError, match=f"PID {os.getpid()}"):
+        _launch_chrome(tmp_path)
+    mock_subprocess.Popen.assert_not_called()
+    mock_port.assert_not_called()
 
 
 @patch("browden.web_navigator.selenium_chrome.backend._launch_chrome")
@@ -326,24 +492,19 @@ def test_get_profile_dir_returns_construction_path(tmp_path):
 
 @patch("browden.web_navigator.selenium_chrome.backend._launch_chrome")
 @patch("browden.web_navigator.selenium_chrome.backend.webdriver")
-def test_drv_restarts_when_current_window_is_gone(mock_webdriver, mock_launch):
-    _patch_launch(mock_launch)
-    # Initial driver that has lost its current window: window_handles still works,
-    # but current_window_handle raises — exactly what _drv()'s health check probes.
-    dead_drv = _make_fake_driver(handles=("h1",))
-    type(dead_drv).current_window_handle = PropertyMock(side_effect=NoSuchWindowException("no such window"))
+def test_drv_recovers_when_current_window_is_gone(mock_webdriver, mock_launch):
+    # A missing focused window is not a dead browser: refocus a remaining
+    # handle rather than tearing the session down and launching another Chrome.
+    drv = _make_fake_driver(handles=("h1",))
+    type(drv).current_window_handle = PropertyMock(side_effect=NoSuchWindowException("no such window"))
 
-    # New driver to be created upon restart
-    alive_drv = _make_fake_driver(handles=("new_h1",))
-    alive_drv.current_window_handle = "new_h1"
-    mock_webdriver.Chrome.return_value = alive_drv
+    backend = _backend_with_driver(drv)
 
-    backend = _backend_with_driver(dead_drv)
-
-    # Any driving call goes through _drv(), whose health check restarts the session.
-    assert backend.list_handles() == ["new_h1"]
-    dead_drv.quit.assert_called_once()
-    assert mock_webdriver.Chrome.call_count == 1
+    assert backend.list_handles() == ["h1"]
+    drv.quit.assert_not_called()
+    mock_launch.assert_not_called()
+    mock_webdriver.Chrome.assert_not_called()
+    drv.switch_to.window.assert_called_with("h1")
 
 
 def test_is_running_probes_session_only_not_current_window():
@@ -364,7 +525,21 @@ def test_is_running_false_and_tears_down_a_dead_session():
     backend = _backend_with_driver(drv)
 
     assert backend.is_running() is False
-    drv.quit.assert_called_once()  # dead session is torn down (but not relaunched)
+    drv.quit.assert_called_once()  # dead driver is detached (but Chrome is not killed)
+
+
+def test_is_running_false_does_not_kill_a_live_chrome_process():
+    drv = _make_fake_driver(dead=True)
+    backend = _backend_with_driver(drv)
+    live_proc = MagicMock(name="live_chrome")
+    live_proc.poll.return_value = None
+    live_proc.pid = 99
+    backend._chrome_proc = live_proc
+
+    assert backend.is_running() is False
+    live_proc.terminate.assert_not_called()
+    live_proc.kill.assert_not_called()
+    assert backend._chrome_proc is live_proc
 
 
 @patch("browden.web_navigator.selenium_chrome.backend._launch_chrome")
@@ -455,3 +630,60 @@ def test_list_tab_ids_returns_handles_without_switching(mock_webdriver, mock_lau
 
     assert backend.list_handles() == ["h1", "h2", "h3"]
     drv.switch_to.window.assert_not_called()  # cheap: no per-tab focus changes
+
+
+@patch("browden.web_navigator.selenium_chrome.backend._launch_chrome")
+@patch("browden.web_navigator.selenium_chrome.backend.webdriver")
+def test_drv_keeps_proc_and_refuses_second_spawn_after_devtools_timeout(
+        mock_webdriver, mock_launch):
+    proc = MagicMock(name="starter")
+    proc.poll.return_value = None
+    proc.pid = 555
+    mock_launch.side_effect = ChromeLaunchError("not ready", proc=proc)
+    backend = _backend()
+
+    with pytest.raises(ChromeLaunchError, match="not ready"):
+        backend._drv()
+    assert backend._chrome_proc is proc
+
+    mock_launch.reset_mock()
+    with pytest.raises(ChromeLaunchError, match="PID 555") as exc:
+        backend._drv()
+    assert "Not launching another Chrome" in str(exc.value)
+    mock_launch.assert_not_called()
+    mock_webdriver.Chrome.assert_not_called()
+    proc.terminate.assert_not_called()
+
+
+@patch("browden.web_navigator.selenium_chrome.backend._launch_chrome")
+@patch("browden.web_navigator.selenium_chrome.backend.webdriver")
+@_posix_lock
+def test_drv_refuses_when_foreign_chrome_holds_the_profile(
+        mock_webdriver, mock_launch, tmp_path):
+    profile = tmp_path / "prof"
+    profile.mkdir()
+    (profile / "SingletonLock").symlink_to(f"testhost-{os.getpid()}")
+    backend = _backend(profile_dir=str(profile))
+
+    with pytest.raises(ChromeLaunchError, match=f"PID {os.getpid()}"):
+        backend._drv()
+    mock_launch.assert_not_called()
+    mock_webdriver.Chrome.assert_not_called()
+
+
+@patch("browden.web_navigator.selenium_chrome.backend._launch_chrome")
+@patch("browden.web_navigator.selenium_chrome.backend.webdriver")
+def test_drv_does_not_kill_chrome_when_selenium_attach_fails(mock_webdriver, mock_launch):
+    proc = MagicMock(name="chrome")
+    proc.poll.return_value = None
+    proc.pid = 12
+    mock_launch.return_value = (proc, 9222)
+    mock_webdriver.Chrome.side_effect = Exception("chrome not reachable")
+    backend = _backend()
+
+    with pytest.raises(ChromeLaunchError, match="could not attach"):
+        backend._drv()
+    proc.terminate.assert_not_called()
+    proc.kill.assert_not_called()
+    assert backend._chrome_proc is proc
+    assert backend._driver is None

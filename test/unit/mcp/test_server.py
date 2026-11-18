@@ -13,6 +13,15 @@ def test_server_instructions_state_concurrency_contract():
     assert "verbatim" in ins  # spells out the tab-id pass-back contract
 
 
+def test_new_blank_tab_doc_warns_not_to_retry_a_held_chrome():
+    """The agent-facing tool doc must say not to kill/retry a stuck Chrome."""
+    import browden.mcp.server as server
+    doc = (server.new_blank_tab.__doc__ or "").lower()
+    assert "cookies" in doc
+    assert "pid" in doc
+    assert "retry" in doc
+
+
 def test_tab_entry_point_docs_state_the_concurrency_contract():
     """new_blank_tab / list_tabs descriptions (what the agent reads) spell it out.
 
@@ -242,6 +251,38 @@ async def test_new_blank_tab_tool_delegates_and_stamps_namespace():
         result = await server.new_blank_tab(profile_dir=None)
     session.new_blank_tab.assert_awaited_once()
     assert result == {"id": "pre-h1", "url": "u", "title": "t", "selected": "True", "profile_dir": "/p"}
+
+
+@pytest.mark.asyncio
+async def test_new_blank_tab_reports_chrome_launch_error_without_retrying():
+    """A stuck/held Chrome is an error envelope, not a second launch."""
+    import browden.mcp.server as server
+    from browden.web_navigator.selenium_chrome import ChromeLaunchError
+    importlib.reload(server)
+    session = _fake_session()
+    session.new_blank_tab = AsyncMock(
+        side_effect=ChromeLaunchError(
+            "Chrome PID 9 already holds this profile; not launching a second instance"))
+    with patch.object(server._store, "get_or_create_session", return_value=session):
+        result = await server.new_blank_tab(profile_dir=None)
+    assert result == {
+        "error": "Chrome PID 9 already holds this profile; not launching a second instance",
+    }
+    session.new_blank_tab.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_tool_wrapper_returns_envelope_for_chrome_launch_error():
+    from browden.mcp.server import _tool
+    from browden.web_navigator.selenium_chrome import ChromeLaunchError
+
+    @_tool
+    async def fake_tool(id: str) -> dict:
+        raise ChromeLaunchError("Chrome PID 9 is still running on this profile")
+
+    envelope = await fake_tool(id="ns-h1")
+    assert envelope["id"] == "ns-h1"
+    assert "PID 9" in envelope["error"]
 
 
 @pytest.mark.asyncio
